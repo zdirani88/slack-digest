@@ -1,0 +1,84 @@
+export type TimeWindow = "24h" | "3d" | "7d";
+
+export interface GleanSnippet {
+  text: string;
+  ranges?: Array<{ startIndex: number; endIndex: number; type: string }>;
+}
+
+export interface GleanAuthor {
+  name?: string;
+  email?: string;
+  obfuscatedId?: string;
+}
+
+export interface GleanDocumentMetadata {
+  datasource?: string;
+  container?: string;
+  containerUrl?: string;
+  updateTime?: string;
+  createTime?: string;
+  author?: GleanAuthor;
+  mimeType?: string;
+  objectType?: string;
+}
+
+export interface GleanSearchResult {
+  title?: string;
+  url?: string;
+  nativeAppUrl?: string;
+  fullTextList?: string[];
+  snippets?: GleanSnippet[];
+  relatedResults?: Array<{
+    relation?: string;
+    results?: Array<{
+      snippets?: GleanSnippet[];
+    }>;
+  }>;
+  document?: {
+    id?: string;
+    datasource?: string;
+    metadata?: GleanDocumentMetadata;
+  };
+  clusteredResults?: GleanSearchResult[];
+}
+
+export interface GleanSearchResponse {
+  results?: GleanSearchResult[];
+  totalCount?: number;
+  hasMoreResults?: boolean;
+  cursor?: string;
+  errorInfo?: { errorMessages?: string[] };
+}
+
+export interface DigestItem {
+  id: string;
+  title: string;
+  channel?: string;
+  channelUrl?: string;
+  preview: string;
+  url?: string;
+  reason?: string;
+  timestamp?: string;
+  author?: string;
+}
+
+export interface DigestGroup {
+  id: string;
+  title: string;
+  emoji: string;
+  summary: string;
+  items: DigestItem[];
+  priority: number;
+}
+
+export interface DigestData {
+  groups: DigestGroup[];
+  generatedAt: string;
+  timeWindow: TimeWindow;
+  totalItems: number;
+}
+
+export interface GleanConfig {
+  token: string;
+  backendUrl: string;
+}
