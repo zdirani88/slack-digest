@@ -26,11 +26,19 @@ export async function searchSlack(
     { query: "@zubin", pages: 2 },
     { query: "thread", pages: 1 },
     { query: "urgent", pages: 1 },
-    { query: "incident", pages: 1 },
+    { query: "incident", pages: 2 },
+    { query: "regression", pages: 1 },
+    { query: "debug", pages: 1 },
     { query: "launch", pages: 1 },
     { query: "idea", pages: 1 },
-    { query: "deal", pages: 1 },
-    { query: "partner", pages: 1 },
+    { query: "deal", pages: 2 },
+    { query: "pipeline", pages: 1 },
+    { query: "prospect", pages: 1 },
+    { query: "customer call", pages: 1 },
+    { query: "partner", pages: 2 },
+    { query: "partnership", pages: 1 },
+    { query: "nvidia", pages: 1 },
+    { query: "joint", pages: 1 },
     { query: "arvind", pages: 1 },
   ];
 
@@ -111,15 +119,16 @@ export async function generateDigestViaGleanChat(
 
   const prompt = `You are a Slack digest assistant for Zubin. Below are ${aiMessages.length} Slack messages/threads from the past ${timeLabels[timeWindow]}.
 
-Organize them into these 6 categories. Return ONLY valid JSON, no markdown fences, no explanation.
+Organize them into these 7 categories. Return ONLY valid JSON, no markdown fences, no explanation.
 
 Categories:
+- system_issues: Incidents, regressions, bugs, outages, latency, failures, security issues, debugging, root cause analysis
 - product_updates: Product launches, roadmap movement, feature changes, customer-facing product news
-- engineering_updates: Infra, incidents, debugging, releases, architecture, implementation threads
+- engineering_updates: Architecture, implementation, infra projects, technical design, non-incident engineering updates
 - ideas_and_innovations: Brainstorms, experiments, feature ideas, AI concepts, open-ended ideation
 - sales_updates: Pipeline, deals, prospects, revenue discussions, enablement, field asks
-- partnership_updates: Partners, customers, vendors, joint work, external collaboration
-- leadership_attention: Cross-functional asks, blockers, direct mentions, urgent updates, executive/leadership-visible items
+- partnership_updates: Partners, partner launches, NVIDIA, customers, vendors, joint work, external collaboration
+- leadership_attention: Direct asks to Zubin, VIP/executive mentions, urgent decisions, leadership-visible items that are not primarily system issues
 
 JSON format:
 {
@@ -146,8 +155,8 @@ JSON format:
   ]
 }
 
-Use these exact group ids: product_updates, engineering_updates, ideas_and_innovations, sales_updates, partnership_updates, leadership_attention.
-Include all 6 groups even if empty (empty items array).
+Use these exact group ids: leadership_attention, system_issues, product_updates, engineering_updates, ideas_and_innovations, sales_updates, partnership_updates.
+Include all 7 groups even if empty (empty items array).
 Only put each item in the single most relevant group.
 
 Messages:
@@ -213,11 +222,12 @@ ${JSON.stringify(aiMessages, null, 2)}`;
 
 const GROUP_META: Array<{ id: string; title: string; emoji: string; priority: number }> = [
   { id: "leadership_attention", title: "Leadership Attention", emoji: "⚠️", priority: 1 },
-  { id: "product_updates", title: "Product Updates", emoji: "🚀", priority: 2 },
-  { id: "engineering_updates", title: "Engineering Updates", emoji: "🛠️", priority: 3 },
-  { id: "ideas_and_innovations", title: "Ideas & Innovation", emoji: "💡", priority: 4 },
-  { id: "sales_updates", title: "Sales Updates", emoji: "📈", priority: 5 },
-  { id: "partnership_updates", title: "Partnership Updates", emoji: "🤝", priority: 6 },
+  { id: "system_issues", title: "System Issues", emoji: "🧯", priority: 2 },
+  { id: "product_updates", title: "Product Updates", emoji: "🚀", priority: 3 },
+  { id: "engineering_updates", title: "Engineering Updates", emoji: "🛠️", priority: 4 },
+  { id: "ideas_and_innovations", title: "Ideas & Innovation", emoji: "💡", priority: 5 },
+  { id: "sales_updates", title: "Sales Updates", emoji: "📈", priority: 6 },
+  { id: "partnership_updates", title: "Partnership Updates", emoji: "🤝", priority: 7 },
 ];
 
 function ensureAllGroups(incoming: DigestGroup[]): DigestGroup[] {
@@ -385,8 +395,8 @@ function scoreMessage(message: {
 
   if (haystack.includes("@")) score += 6;
   if (haystack.includes("urgent") || haystack.includes("asap") || haystack.includes("blocker")) score += 6;
-  if (haystack.includes("incident") || haystack.includes("regression") || haystack.includes("launch")) score += 5;
-  if (haystack.includes("deal") || haystack.includes("partner") || haystack.includes("customer")) score += 4;
+  if (isSystemIssueText(haystack) || haystack.includes("launch")) score += 5;
+  if (isSalesText(haystack) || isPartnershipText(haystack)) score += 4;
   if (haystack.includes("idea") || haystack.includes("ai") || haystack.includes("prototype")) score += 3;
   if (haystack.includes("thread between") || haystack.includes("thread_ts")) score += 5;
   if (haystack.includes("dm") || haystack.includes("direct message")) score += 4;
@@ -465,6 +475,27 @@ function chooseGroup(message: {
 }) {
   const haystack = `${message.title} ${message.content}`.toLowerCase();
 
+  if (isSystemIssueText(haystack)) {
+    return {
+      id: "system_issues",
+      reason: "This looks like an incident, bug, regression, or debugging thread that should be separated from leadership asks.",
+    };
+  }
+
+  if (isSalesText(haystack)) {
+    return {
+      id: "sales_updates",
+      reason: "This thread appears related to pipeline, field work, revenue, or customer-commercial updates.",
+    };
+  }
+
+  if (isPartnershipText(haystack)) {
+    return {
+      id: "partnership_updates",
+      reason: "This message references partners, customers, external collaborators, or shared go-to-market work.",
+    };
+  }
+
   if (
     haystack.includes("@") ||
     haystack.includes("urgent") ||
@@ -498,18 +529,16 @@ function chooseGroup(message: {
   }
 
   if (
-    haystack.includes("incident") ||
-    haystack.includes("debug") ||
-    haystack.includes("root cause") ||
     haystack.includes("infra") ||
-    haystack.includes("latency") ||
     haystack.includes("deployment") ||
-    haystack.includes("regression") ||
+    haystack.includes("architecture") ||
+    haystack.includes("implementation") ||
+    haystack.includes("technical design") ||
     haystack.includes("engineering")
   ) {
     return {
       id: "engineering_updates",
-      reason: "This thread looks like engineering work, debugging, infrastructure, or release execution.",
+      reason: "This thread looks like engineering work, architecture, infrastructure, or release execution.",
     };
   }
 
@@ -528,39 +557,67 @@ function chooseGroup(message: {
     };
   }
 
-  if (
-    haystack.includes("deal") ||
-    haystack.includes("pipeline") ||
-    haystack.includes("prospect") ||
-    haystack.includes("sales") ||
-    haystack.includes("revenue") ||
-    haystack.includes("customer call") ||
-    haystack.includes("pricing")
-  ) {
-    return {
-      id: "sales_updates",
-      reason: "This thread appears related to pipeline, field work, or customer-commercial updates.",
-    };
-  }
-
-  if (
-    haystack.includes("partner") ||
-    haystack.includes("vendor") ||
-    haystack.includes("customer") ||
-    haystack.includes("nvidia") ||
-    haystack.includes("joint") ||
-    haystack.includes("external")
-  ) {
-    return {
-      id: "partnership_updates",
-      reason: "This message references partnership, external collaborators, or shared go-to-market work.",
-    };
-  }
-
   return {
     id: "product_updates",
     reason: "This is informational but appears closest to the broader product narrative.",
   };
+}
+
+function isSystemIssueText(value: string) {
+  return [
+    "incident",
+    "debug",
+    "root cause",
+    "outage",
+    "latency",
+    "regression",
+    "bug",
+    "failure",
+    "failed",
+    "error",
+    "broken",
+    "blocker",
+    "escalation",
+    "security",
+    "sev",
+    "p0",
+    "p1",
+  ].some((term) => value.includes(term));
+}
+
+function isSalesText(value: string) {
+  return [
+    "deal",
+    "pipeline",
+    "prospect",
+    "sales",
+    "revenue",
+    "customer call",
+    "pricing",
+    "renewal",
+    "expansion",
+    "account",
+    "ae ",
+    "gtm",
+    "field",
+    "opportunity",
+  ].some((term) => value.includes(term));
+}
+
+function isPartnershipText(value: string) {
+  return [
+    "partner",
+    "partnership",
+    "vendor",
+    "nvidia",
+    "joint",
+    "external",
+    "alliance",
+    "integration partner",
+    "co-sell",
+    "launch partner",
+    "customer",
+  ].some((term) => value.includes(term));
 }
 
 function summarizeGroup(group: DigestGroup) {
