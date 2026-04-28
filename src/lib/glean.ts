@@ -4,6 +4,9 @@ import {
   GleanSearchResponse,
   DigestGroup,
   DigestData,
+  DigestItem,
+  DigestSignals,
+  DigestAction,
 } from "@/types";
 
 export function getTimeRange(window: TimeWindow) {
@@ -13,6 +16,29 @@ export function getTimeRange(window: TimeWindow) {
 }
 
 const GLEAN_TIMEOUT_MS = 25000;
+
+type MessageCandidate = {
+  id: string;
+  title: string;
+  channel: string;
+  channelUrl: string;
+  channelId: string;
+  author: string;
+  timestamp: string;
+  originalTimestamp: string;
+  latestActivityTimestamp: string;
+  url: string;
+  authorUrl: string;
+  content: string;
+  signals: DigestSignals;
+};
+
+type AiDigestEnrichment = {
+  summary?: string;
+  threadSummary?: string;
+  reason?: string;
+  suggestedActions?: DigestAction[];
+};
 
 export async function searchSlack(
   timeWindow: TimeWindow,
@@ -105,30 +131,45 @@ export async function generateDigestViaGleanChat(
     "7d": "7 days",
   };
 
-  const messages = results.map((r, i) => ({
-    id: `item_${i}`,
-    title: r.title ?? "Untitled",
-    channel: r.document?.metadata?.container ?? "unknown",
-    channelUrl: r.document?.metadata?.containerUrl ?? "",
-    author: r.document?.metadata?.author?.name ?? "unknown",
-    timestamp: r.document?.metadata?.updateTime ?? r.document?.metadata?.createTime ?? "",
-    url: r.nativeAppUrl ?? r.url ?? "",
-    content:
-      r.fullTextList?.join(" ") ??
-      r.relatedResults
-        ?.flatMap((group) => group.results ?? [])
-        .flatMap((entry) => entry.snippets?.map((snippet) => snippet.text) ?? [])
-        .join(" ") ??
-      r.snippets?.map((s) => s.text).join(" ") ??
-      "",
-  }));
+  const messages: MessageCandidate[] = results.map((r, i) => {
+    const messageUrl = r.nativeAppUrl ?? r.url ?? "";
+    const originalTimestamp = normalizeTimestamp(r.document?.metadata?.createTime);
+    const latestActivityTimestamp = normalizeTimestamp(
+      r.document?.metadata?.updateTime,
+      r.document?.metadata?.createTime
+    );
+
+    return {
+      id: `item_${i}`,
+      title: r.title ?? "Untitled",
+      channel: r.document?.metadata?.container ?? "unknown",
+      channelUrl: r.document?.metadata?.containerUrl ?? deriveSlackChannelUrl(messageUrl),
+      channelId: r.document?.metadata?.containerId ?? "",
+      author: r.document?.metadata?.author?.name ?? "unknown",
+      timestamp: latestActivityTimestamp,
+      originalTimestamp,
+      latestActivityTimestamp,
+      url: messageUrl,
+      authorUrl: "",
+      content: extractSlackContent(r),
+      signals: inferSignals(r),
+    };
+  });
 
   // Keep the AI prompt bounded even when retrieval gets much broader.
   const aiMessages = prioritizeMessages(messages).slice(0, 80);
+  const itemEnrichments = await generateItemEnrichmentsViaGleanChat(
+    aiMessages,
+    token,
+    backendUrl
+  ).catch(() => new Map<string, AiDigestEnrichment>());
 
   const prompt = `You are a Slack digest assistant for Zubin. Below are ${aiMessages.length} Slack messages/threads from the past ${timeLabels[timeWindow]}.
 
 Organize them into these 8 categories. Return ONLY valid JSON, no markdown fences, no explanation.
+You must include every provided message exactly once by id. If you are unsure about a category, choose the closest category, but do not omit the item.
+For each item, write a fresh one-line AI summary that answers "why should I care?" Do not copy the title unless it is already the clearest possible punchline.
+Also write a specific "reason" explaining why the item surfaced; do not use generic category descriptions.
 
 Categories:
 - system_issues: Human discussion about important incidents, regressions, bugs, outages, failures, security issues, debugging, root cause analysis
@@ -154,11 +195,22 @@ JSON format:
           "title": "short descriptive title",
           "channel": "channel-name",
           "channelUrl": "url or empty string",
+          "summary": "one-line punchline, 90 characters max, answers why Zubin should care",
           "preview": "1-2 sentence preview",
+          "rawExcerpt": "short excerpt from the original Slack text",
+          "threadSummary": "brief gist of the thread/comments",
           "url": "original url or empty string",
-          "reason": "why this belongs here",
+          "reason": "specific why surfaced explanation based on engagement, people, topic, channel, or freshness",
           "timestamp": "ISO timestamp or empty string",
-          "author": "author name"
+          "author": "author name",
+          "suggestedActions": [
+            {
+              "id": "short_snake_case_id",
+              "label": "short action label",
+              "prompt": "pre-populated Glean prompt for this action",
+              "rationale": "why this action is useful"
+            }
+          ]
         }
       ]
     }
@@ -212,10 +264,10 @@ ${JSON.stringify(aiMessages, null, 2)}`;
       aiMessage.content ??
       "";
 
-    const jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    const jsonText = extractJsonObject(rawText);
     parsed = JSON.parse(jsonText);
   } catch {
-    const fallbackGroups = buildFallbackGroups(messages);
+    const fallbackGroups = buildFallbackGroups(messages, itemEnrichments);
     parsed = {
       groups: fallbackGroups.length > 0
         ? fallbackGroups
@@ -223,7 +275,12 @@ ${JSON.stringify(aiMessages, null, 2)}`;
     };
   }
 
-  const groups = ensureAllGroups(parsed.groups ?? []);
+  const groupsWithAllMessages = appendMissingMessages(
+    parsed.groups ?? [],
+    messages,
+    itemEnrichments
+  );
+  const groups = enrichGroups(ensureAllGroups(groupsWithAllMessages), messages, itemEnrichments);
   const totalItems = groups.reduce((sum, g) => sum + g.items.length, 0);
 
   return {
@@ -293,16 +350,226 @@ async function fetchSearchPage({
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
+    const body = await readErrorBody(res);
     throw new Error(`Glean search ${res.status}: ${body}`);
   }
 
   const data: GleanSearchResponse = await res.json();
   if (data.errorInfo?.errorMessages?.length) {
-    throw new Error(data.errorInfo.errorMessages.join("; "));
+    throw new Error(formatGleanErrorMessages(data.errorInfo.errorMessages));
   }
 
   return data;
+}
+
+function formatGleanErrorMessages(messages: unknown[]) {
+  return messages
+    .map((message) => {
+      if (typeof message === "string") {
+        return message;
+      }
+
+      if (message && typeof message === "object") {
+        const record = message as Record<string, unknown>;
+        const useful =
+          record.message ??
+          record.errorMessage ??
+          record.error ??
+          record.reason ??
+          record.code ??
+          record.status;
+
+        return typeof useful === "string" || typeof useful === "number"
+          ? String(useful)
+          : JSON.stringify(record);
+      }
+
+      return String(message);
+    })
+    .filter(Boolean)
+    .join("; ");
+}
+
+async function readErrorBody(res: Response) {
+  const text = await res.text().catch(() => "");
+  if (!text) {
+    return res.statusText || "Unknown error";
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.errorInfo?.errorMessages?.length) {
+      return formatGleanErrorMessages(parsed.errorInfo.errorMessages);
+    }
+
+    if (parsed?.message || parsed?.error || parsed?.errorMessage) {
+      return String(parsed.message ?? parsed.error ?? parsed.errorMessage);
+    }
+
+    return JSON.stringify(parsed);
+  } catch {
+    return text;
+  }
+}
+
+async function generateItemEnrichmentsViaGleanChat(
+  messages: MessageCandidate[],
+  token: string,
+  backendUrl: string
+): Promise<Map<string, AiDigestEnrichment>> {
+  if (messages.length === 0) {
+    return new Map();
+  }
+
+  const enrichments = new Map<string, AiDigestEnrichment>();
+  const batchSize = 15;
+
+  for (let index = 0; index < messages.length; index += batchSize) {
+    const batch = messages.slice(index, index + batchSize);
+    const batchEnrichments = await generateItemEnrichmentBatchViaGleanChat(batch, token, backendUrl);
+
+    for (const [id, enrichment] of Array.from(batchEnrichments.entries())) {
+      enrichments.set(id, enrichment);
+    }
+  }
+
+  return enrichments;
+}
+
+async function generateItemEnrichmentBatchViaGleanChat(
+  messages: MessageCandidate[],
+  token: string,
+  backendUrl: string
+): Promise<Map<string, AiDigestEnrichment>> {
+  const chatUrl = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/chat`;
+  const prompt = `You are creating concise Slack digest entries for Zubin.
+
+For each Slack item below, return ONLY valid JSON. No markdown fences.
+Write a real one-line summary from the Slack text. Do not use generic phrases like "human-readable system issue discussion."
+Every summary and reason must be specific to that item. Mention the actual topic, decision, customer, incident, person, or next step when available.
+
+JSON format:
+{
+  "items": [
+    {
+      "id": "item_0",
+      "summary": "one-line punchline, max 90 characters, answers why Zubin should care",
+      "threadSummary": "1-2 sentence gist of the post and replies",
+      "reason": "specific reason it surfaced, based on topic, people, channel, engagement, or freshness",
+      "suggestedActions": [
+        {
+          "id": "short_snake_case_id",
+          "label": "short action label",
+          "prompt": "pre-populated Glean prompt for this action",
+          "rationale": "why this action is useful"
+        }
+      ]
+    }
+  ]
+}
+
+Items:
+${JSON.stringify(
+  messages.map((message) => ({
+    id: message.id,
+    title: message.title,
+    channel: message.channel,
+    author: message.author,
+    timestamp: message.latestActivityTimestamp || message.originalTimestamp || message.timestamp,
+    signals: message.signals,
+    content: compactText(message.content).slice(0, 1200),
+  })),
+  null,
+  2
+)}`;
+
+  const res = await fetchWithRetry(chatUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messages: [{ author: "USER", fragments: [{ text: prompt }] }],
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await readErrorBody(res);
+    throw new Error(`Glean chat ${res.status}: ${body}`);
+  }
+
+  const data = await res.json();
+  const responseMessages: Array<{ author?: string; fragments?: Array<{ text?: string }>; content?: string }> =
+    data.messages ?? data.followUpResults ?? [];
+  const aiMessage = responseMessages.find(
+    (m) => m.author === "GLEAN_AI" || m.author === "ASSISTANT"
+  ) ?? responseMessages[responseMessages.length - 1];
+
+  const rawText =
+    aiMessage?.fragments?.map((f) => f.text ?? "").join("") ??
+    aiMessage?.content ??
+    "";
+  const parsed = JSON.parse(extractJsonObject(rawText)) as { items?: Array<AiDigestEnrichment & { id?: string }> };
+  const enrichments = new Map<string, AiDigestEnrichment>();
+
+  for (const item of parsed.items ?? []) {
+    if (!item.id) continue;
+
+    enrichments.set(item.id, {
+      summary: normalizeText(item.summary),
+      threadSummary: normalizeText(item.threadSummary),
+      reason: normalizeText(item.reason),
+      suggestedActions: normalizeActions(item.suggestedActions),
+    });
+  }
+
+  return enrichments;
+}
+
+function extractJsonObject(value: string) {
+  const withoutFence = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+
+  if (start >= 0 && end > start) {
+    return withoutFence.slice(start, end + 1);
+  }
+
+  return withoutFence;
+}
+
+function normalizeActions(value: unknown): DigestAction[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const actions = value
+    .map((action) => {
+      if (!action || typeof action !== "object") {
+        return null;
+      }
+
+      const record = action as Record<string, unknown>;
+      const label = normalizeText(record.label);
+      const prompt = normalizeText(record.prompt);
+      const rationale = normalizeText(record.rationale);
+
+      if (!label || !prompt) {
+        return null;
+      }
+
+      return {
+        id: normalizeText(record.id) || label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, ""),
+        label,
+        prompt,
+        rationale,
+      };
+    })
+    .filter((action): action is DigestAction => Boolean(action));
+
+  return actions.length ? actions.slice(0, 3) : undefined;
 }
 
 async function fetchWithRetry(url: string, init: RequestInit, attempt = 0): Promise<Response> {
@@ -383,17 +650,49 @@ function dedupeSlackResults(results: GleanSearchResult[]) {
   return deduped;
 }
 
+function extractSlackContent(result: GleanSearchResult) {
+  const parts = [
+    ...(result.fullTextList ?? []),
+    ...((result.relatedResults ?? [])
+      .flatMap((group) => group.results ?? [])
+      .flatMap((entry) => entry.snippets?.map((snippet) => snippet.text) ?? [])),
+    ...(result.snippets?.map((snippet) => snippet.text) ?? []),
+  ];
+
+  return parts
+    .map((part) => normalizeText(part))
+    .filter(Boolean)
+    .filter((part, index, all) => all.indexOf(part) === index)
+    .join("\n\n");
+}
+
+function normalizeTimestamp(...values: Array<string | undefined>) {
+  for (const value of values) {
+    if (!value) continue;
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) continue;
+
+    // Glean often uses the Unix epoch as a placeholder for "unknown".
+    if (date.getUTCFullYear() <= 1971) continue;
+
+    return value;
+  }
+
+  return "";
+}
+
+function deriveSlackChannelUrl(value: string) {
+  if (!value.includes("slack.com/archives/")) {
+    return "";
+  }
+
+  const match = value.match(/^(https:\/\/[^/]+\/archives\/[^/?#]+)/);
+  return match?.[1] ?? "";
+}
+
 function prioritizeMessages(
-  messages: Array<{
-    id: string;
-    title: string;
-    channel: string;
-    channelUrl: string;
-    author: string;
-    timestamp: string;
-    url: string;
-    content: string;
-  }>
+  messages: MessageCandidate[]
 ) {
   return [...messages].sort((a, b) => scoreMessage(b) - scoreMessage(a));
 }
@@ -425,16 +724,8 @@ function scoreMessage(message: {
 }
 
 function buildFallbackGroups(
-  messages: Array<{
-    id: string;
-    title: string;
-    channel: string;
-    channelUrl: string;
-    author: string;
-    timestamp: string;
-    url: string;
-    content: string;
-  }>
+  messages: MessageCandidate[],
+  itemEnrichments = new Map<string, AiDigestEnrichment>()
 ): DigestGroup[] {
   const grouped = new Map<string, DigestGroup>();
 
@@ -449,17 +740,42 @@ function buildFallbackGroups(
   const channelBuckets = new Map<string, typeof messages>();
 
   for (const message of messages) {
+    const enrichment = itemEnrichments.get(message.id);
     const preview = compactText(message.content || message.title);
+    const topics = inferTopics(`${message.title} ${message.channel} ${message.content}`);
+    const score = scoreDigestItem({
+      title: message.title,
+      channel: message.channel,
+      content: message.content,
+      timestamp: message.latestActivityTimestamp,
+      signals: message.signals,
+      topics,
+    });
     const item = {
       id: message.id,
       title: message.title || deriveTitleFromPreview(preview),
       channel: message.channel,
       channelUrl: message.channelUrl,
+      channelId: message.channelId,
+      summary: enrichment?.summary ?? makePunchline(message.title, message.content),
       preview,
+      rawExcerpt: preview,
+      threadSummary: enrichment?.threadSummary ?? summarizeThread(message.content),
+      fullText: message.content || preview,
       url: message.url,
       reason: "",
       timestamp: message.timestamp,
+      originalTimestamp: message.originalTimestamp,
+      latestActivityTimestamp: message.latestActivityTimestamp,
       author: message.author,
+      authorUrl: message.authorUrl,
+      rankingScore: score.total,
+      scoreExplanation: score.explanation,
+      signals: message.signals,
+      suggestedActions: enrichment?.suggestedActions ?? suggestActions(message.title, message.content, message.channel),
+      topics,
+      isSuppressed: score.isSuppressed,
+      suppressionReason: score.suppressionReason,
     };
 
     const bucket = chooseGroup(message);
@@ -467,7 +783,7 @@ function buildFallbackGroups(
     if (target) {
       target.items.push({
         ...item,
-        reason: bucket.reason,
+        reason: enrichment?.reason ?? bucket.reason,
       });
     }
 
@@ -483,6 +799,132 @@ function buildFallbackGroups(
   });
 
   return results;
+}
+
+function appendMissingMessages(
+  aiGroups: DigestGroup[],
+  messages: MessageCandidate[],
+  itemEnrichments = new Map<string, AiDigestEnrichment>()
+) {
+  const seenIds = new Set(
+    aiGroups.flatMap((group) => group.items.map((item) => item.id))
+  );
+  const missingMessages = messages.filter((message) => !seenIds.has(message.id));
+
+  if (missingMessages.length === 0) {
+    return aiGroups;
+  }
+
+  const fallbackGroups = buildFallbackGroups(missingMessages, itemEnrichments);
+  const merged = new Map<string, DigestGroup>();
+
+  for (const group of ensureAllGroups(aiGroups)) {
+    merged.set(group.id, {
+      ...group,
+      items: [...group.items],
+    });
+  }
+
+  for (const group of fallbackGroups) {
+    const target = merged.get(group.id);
+    if (!target) {
+      merged.set(group.id, group);
+      continue;
+    }
+
+    target.items.push(...group.items);
+  }
+
+  return GROUP_META.map((meta) => merged.get(meta.id) ?? { ...meta, summary: "", items: [] });
+}
+
+function enrichGroups(
+  groups: DigestGroup[],
+  messages: MessageCandidate[],
+  itemEnrichments = new Map<string, AiDigestEnrichment>()
+): DigestGroup[] {
+  const byId = new Map(messages.map((message) => [message.id, message]));
+
+  return groups.map((group) => ({
+    ...group,
+    items: group.items
+      .map((item) => {
+        const message = byId.get(item.id);
+        if (!message) return enrichStandaloneItem(item);
+
+        const enrichment = itemEnrichments.get(message.id);
+        const content = message.content || item.fullText || item.preview || item.title;
+        const topics = inferTopics(`${message.title} ${message.channel} ${content}`);
+        const score = scoreDigestItem({
+          title: message.title,
+          channel: message.channel,
+          content,
+          timestamp: message.latestActivityTimestamp,
+          signals: message.signals,
+          topics,
+        });
+
+        return {
+          ...item,
+          channel: item.channel ?? message.channel,
+          channelUrl: item.channelUrl ?? message.channelUrl,
+          channelId: item.channelId ?? message.channelId,
+          summary: enrichment?.summary ?? item.summary ?? makePunchline(item.title || message.title, content),
+          preview: item.preview || compactText(content),
+          rawExcerpt: item.rawExcerpt ?? compactText(content),
+          threadSummary: enrichment?.threadSummary ?? item.threadSummary ?? summarizeThread(content),
+          fullText: item.fullText ?? content,
+          url: item.url ?? message.url,
+          timestamp: item.timestamp ?? message.latestActivityTimestamp,
+          originalTimestamp: item.originalTimestamp ?? message.originalTimestamp,
+          latestActivityTimestamp: item.latestActivityTimestamp ?? message.latestActivityTimestamp,
+          author: item.author ?? message.author,
+          authorUrl: item.authorUrl ?? message.authorUrl,
+          rankingScore: item.rankingScore ?? score.total,
+          scoreExplanation: item.scoreExplanation ?? score.explanation,
+          reason: enrichment?.reason ?? makeSpecificFallbackReason(message, score.explanation),
+          signals: item.signals ?? message.signals,
+          suggestedActions:
+            enrichment?.suggestedActions ??
+            item.suggestedActions ??
+            suggestActions(item.title || message.title, content, message.channel),
+          topics: item.topics ?? topics,
+          isSuppressed: item.isSuppressed ?? score.isSuppressed,
+          suppressionReason: item.suppressionReason ?? score.suppressionReason,
+        };
+      })
+      .sort((a, b) => (b.rankingScore ?? 0) - (a.rankingScore ?? 0)),
+  }));
+}
+
+function enrichStandaloneItem(item: DigestItem): DigestItem {
+  const content = item.fullText || item.preview || item.title;
+  const signals = item.signals ?? emptySignals();
+  const topics = item.topics ?? inferTopics(`${item.title} ${item.channel ?? ""} ${content}`);
+  const score = scoreDigestItem({
+    title: item.title,
+    channel: item.channel ?? "",
+    content,
+    timestamp: item.latestActivityTimestamp ?? item.timestamp ?? "",
+    signals,
+    topics,
+  });
+
+  return {
+    ...item,
+    summary: item.summary ?? makePunchline(item.title, content),
+    rawExcerpt: item.rawExcerpt ?? compactText(content),
+    threadSummary: item.threadSummary ?? summarizeThread(content),
+    fullText: item.fullText ?? content,
+    rankingScore: item.rankingScore ?? score.total,
+    scoreExplanation: item.scoreExplanation ?? score.explanation,
+    reason: item.reason || score.explanation,
+    signals,
+    suggestedActions: item.suggestedActions ?? suggestActions(item.title, content, item.channel ?? ""),
+    topics,
+    isSuppressed: item.isSuppressed ?? score.isSuppressed,
+    suppressionReason: item.suppressionReason ?? score.suppressionReason,
+  };
 }
 
 function chooseGroup(message: {
@@ -758,6 +1200,194 @@ function isPartnershipText(value: string) {
   ].some((term) => value.includes(term));
 }
 
+function inferSignals(result: GleanSearchResult): DigestSignals {
+  const text = extractSlackContent(result).toLowerCase();
+  const relatedCount = (result.relatedResults ?? [])
+    .flatMap((group) => group.results ?? [])
+    .length;
+  const clusteredCount = result.clusteredResults?.length ?? 0;
+  const reactions = countMatches(text, [":+", " reacted", "reaction", "👍", "❤️"]);
+  const replies = Math.max(relatedCount, countMatches(text, [" replied", " thread ", "comment", "response"]));
+  const forwards = Math.max(clusteredCount, countMatches(text, ["forwarded", "reposted", "shared in", "cross-posted"]));
+
+  return {
+    replies,
+    reactions,
+    forwards,
+    engagement: replies * 2 + reactions + forwards * 4,
+    affinity: 0,
+    freshness: 0,
+    visibility: 0,
+    noisePenalty: 0,
+  };
+}
+
+function scoreDigestItem({
+  title,
+  channel,
+  content,
+  timestamp,
+  signals,
+  topics,
+}: {
+  title: string;
+  channel: string;
+  content: string;
+  timestamp: string;
+  signals: DigestSignals;
+  topics: string[];
+}) {
+  const haystack = `${title} ${channel} ${content}`.toLowerCase();
+  const ageHours = getAgeHours(timestamp);
+  const freshness = ageHours === null ? 3 : Math.max(0, 20 - Math.min(20, ageHours / 6));
+  const affinity = topics.length * 2 + (isVipOrLeaderText(haystack) ? 8 : 0);
+  const visibility = getVisibilityScore(channel, haystack);
+  const noisePenalty = getNoisePenalty(channel, haystack);
+  const engagement = Math.min(24, signals.engagement);
+  const forwards = Math.min(12, signals.forwards * 4);
+  const total = Math.round(engagement + affinity + freshness + visibility + forwards - noisePenalty);
+  const reasons = [
+    engagement > 5 ? "high engagement" : "",
+    affinity > 4 ? "matches inferred interests or VIP signals" : "",
+    freshness > 12 ? "recent thread activity" : "",
+    visibility > 4 ? "broad or important channel" : "",
+    forwards > 0 ? "forwarded or reposted signal" : "",
+    noisePenalty > 0 ? "deweighted noisy channel" : "",
+  ].filter(Boolean);
+
+  return {
+    total,
+    explanation: reasons.length ? sentenceCase(reasons.join(", ")) : "Relevant Slack activity in the selected window.",
+    isSuppressed: noisePenalty > 0 && total < 12,
+    suppressionReason: noisePenalty > 0 ? "High-volume channel was deweighted." : "",
+  };
+}
+
+function makeSpecificFallbackReason(message: MessageCandidate, scoreExplanation: string) {
+  const topics = inferTopics(`${message.title} ${message.channel} ${message.content}`);
+  const signals = [
+    message.signals.replies > 0 ? `${message.signals.replies} repl${message.signals.replies === 1 ? "y" : "ies"}` : "",
+    message.signals.reactions > 0 ? `${message.signals.reactions} reaction${message.signals.reactions === 1 ? "" : "s"}` : "",
+    message.signals.forwards > 0 ? `${message.signals.forwards} repost/forward signal${message.signals.forwards === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+  const topicText = topics.length ? ` around ${topics.slice(0, 2).join(" and ")}` : "";
+  const signalText = signals.length ? ` with ${signals.join(", ")}` : "";
+  const channelText = message.channel ? ` in #${message.channel}` : "";
+  const authorText = message.author && message.author !== "unknown" ? ` from ${message.author}` : "";
+
+  return `Surfaced${channelText}${authorText}${topicText}${signalText}; ${scoreExplanation.toLowerCase()}`;
+}
+
+function inferTopics(value: string) {
+  const text = value.toLowerCase();
+  const candidates: Array<[string, string[]]> = [
+    ["AI", ["ai", "agent", "llm", "model", "glean assistant"]],
+    ["Product", ["product", "launch", "roadmap", "feature", "release"]],
+    ["Engineering", ["architecture", "implementation", "infra", "api", "backend", "frontend", "schema"]],
+    ["Ideas", ["idea", "brainstorm", "experiment", "prototype", "what if", "proposal"]],
+    ["Sales", ["deal", "pipeline", "prospect", "sales", "revenue", "pricing"]],
+    ["Partnerships", ["partner", "partnership", "nvidia", "alliance", "co-sell"]],
+    ["Reliability", ["incident", "regression", "bug", "latency", "outage", "debug"]],
+  ];
+
+  return candidates
+    .filter(([, terms]) => terms.some((term) => text.includes(term)))
+    .map(([topic]) => topic)
+    .slice(0, 5);
+}
+
+function makePunchline(title: string, content: string) {
+  const text = compactText(content || title);
+  if (!text || text === "No preview available.") return title;
+
+  const firstSentence = text.split(/(?<=[.!?])\s+/)[0] ?? text;
+  return firstSentence.length > 120 ? `${firstSentence.slice(0, 117)}...` : firstSentence;
+}
+
+function summarizeThread(content: string) {
+  const normalized = normalizeText(content);
+  if (!normalized) return "No thread summary available.";
+
+  const sentences = normalized.split(/(?<=[.!?])\s+/).filter(Boolean);
+  return sentences.slice(0, 3).join(" ");
+}
+
+function suggestActions(title: string, content: string, channel: string): DigestAction[] {
+  const text = `${title} ${channel} ${content}`.toLowerCase();
+  const actions: DigestAction[] = [];
+
+  if (isSalesText(text) || isPartnershipText(text)) {
+    actions.push({
+      id: "share_partner_context",
+      label: "Share with partner or GTM lead",
+      prompt: `Draft a concise internal note explaining the partner/customer implications of this Slack thread: ${title}`,
+      rationale: "The thread appears tied to external collaboration or revenue motion.",
+    });
+  }
+
+  if (isSystemIssueText(text) || isEngineeringUpdateText(text)) {
+    actions.push({
+      id: "summarize_implications",
+      label: "Summarize implications",
+      prompt: `Summarize the technical implications, owner, current status, and suggested follow-up for this Slack thread: ${title}`,
+      rationale: "The thread may affect reliability, execution, or engineering priorities.",
+    });
+  }
+
+  if (text.includes("@") || text.includes("can you") || text.includes("please")) {
+    actions.push({
+      id: "draft_response",
+      label: "Draft a response",
+      prompt: `Draft a short Slack response for this thread. Be helpful, direct, and ask one clarifying question only if needed: ${title}`,
+      rationale: "The thread looks like it may need a reply from you.",
+    });
+  }
+
+  return actions.slice(0, 3);
+}
+
+function emptySignals(): DigestSignals {
+  return {
+    replies: 0,
+    reactions: 0,
+    forwards: 0,
+    engagement: 0,
+    affinity: 0,
+    freshness: 0,
+    visibility: 0,
+    noisePenalty: 0,
+  };
+}
+
+function getAgeHours(value: string) {
+  if (!value) return null;
+  const time = new Date(value).getTime();
+  if (Number.isNaN(time)) return null;
+  return Math.max(0, (Date.now() - time) / 36e5);
+}
+
+function getVisibilityScore(channel: string, text: string) {
+  const value = `${channel} ${text}`.toLowerCase();
+  if (value.includes("leadership") || value.includes("company") || value.includes("exec")) return 8;
+  if (value.includes("public") || value.includes("announce") || value.includes("general")) return 5;
+  return 2;
+}
+
+function getNoisePenalty(channel: string, text: string) {
+  const value = `${channel} ${text}`.toLowerCase();
+  if (value.includes("alerts") || value.includes("notifications") || value.includes("bot")) return 12;
+  if (value.includes("help-") || value.includes("triage") || value.includes("escalations")) return 5;
+  return 0;
+}
+
+function countMatches(value: string, terms: string[]) {
+  return terms.reduce((count, term) => count + (value.includes(term) ? 1 : 0), 0);
+}
+
+function sentenceCase(value: string) {
+  return value ? `${value[0].toUpperCase()}${value.slice(1)}.` : value;
+}
+
 function summarizeGroup(group: DigestGroup) {
   if (group.items.length === 0) {
     return "";
@@ -772,12 +1402,16 @@ function summarizeGroup(group: DigestGroup) {
 }
 
 function compactText(value: string) {
-  const text = value.replace(/\s+/g, " ").trim();
+  const text = normalizeText(value);
   if (!text) {
     return "No preview available.";
   }
 
   return text.length > 240 ? `${text.slice(0, 237)}...` : text;
+}
+
+function normalizeText(value: unknown) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 }
 
 function deriveTitleFromPreview(preview: string) {

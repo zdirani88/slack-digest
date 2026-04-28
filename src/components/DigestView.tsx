@@ -8,9 +8,13 @@ import {
   Archive,
   CheckCircle2,
   ExternalLink,
+  Hash,
   Inbox,
   Layers3,
+  Plus,
   RotateCcw,
+  SlidersHorizontal,
+  User,
 } from "lucide-react";
 
 interface Props {
@@ -19,11 +23,17 @@ interface Props {
 }
 
 const DISMISSED_STORAGE_KEY = "slack_digest_dismissed_items";
+const INTERESTS_STORAGE_KEY = "slack_digest_interests";
+
+type SortMode = "priority" | "recency";
 
 export default function DigestView({ digest }: Props) {
   const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
   const [activeGroupId, setActiveGroupId] = useState("");
   const [selectedItemKey, setSelectedItemKey] = useState<string | null>(null);
+  const [sortMode, setSortMode] = useState<SortMode>("priority");
+  const [interests, setInterests] = useState<string[]>([]);
+  const [interestDraft, setInterestDraft] = useState("");
 
   useEffect(() => {
     try {
@@ -34,6 +44,18 @@ export default function DigestView({ digest }: Props) {
     }
   }, []);
 
+  const inferredInterests = useMemo(() => inferInterestsFromDigest(digest), [digest]);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(INTERESTS_STORAGE_KEY) ?? "[]");
+      const savedInterests = Array.isArray(saved) ? saved : [];
+      setInterests(savedInterests.length ? savedInterests : inferredInterests.slice(0, 6));
+    } catch {
+      setInterests(inferredInterests.slice(0, 6));
+    }
+  }, [inferredInterests]);
+
   const groups = useMemo(() => {
     return digest.groups.map((group) => ({
       ...group,
@@ -43,7 +65,10 @@ export default function DigestView({ digest }: Props) {
 
   const visibleGroups = groups.filter((group) => group.items.length > 0);
   const activeGroup = groups.find((group) => group.id === activeGroupId) ?? visibleGroups[0];
-  const activeItems = activeGroup?.items ?? [];
+  const activeItems = useMemo(() => {
+    const items = activeGroup?.items ?? [];
+    return rankItems(items, sortMode, interests);
+  }, [activeGroup, sortMode, interests]);
   const selectedItem =
     activeItems.find((item) => getItemKey(item) === selectedItemKey) ?? activeItems[0] ?? null;
   const remainingItems = groups.reduce((sum, group) => sum + group.items.length, 0);
@@ -96,6 +121,22 @@ export default function DigestView({ digest }: Props) {
     persistDismissed(new Set());
   }
 
+  function addInterest() {
+    const value = interestDraft.trim();
+    if (!value || interests.some((interest) => interest.toLowerCase() === value.toLowerCase())) return;
+
+    const next = [...interests, value];
+    setInterests(next);
+    localStorage.setItem(INTERESTS_STORAGE_KEY, JSON.stringify(next));
+    setInterestDraft("");
+  }
+
+  function removeInterest(value: string) {
+    const next = interests.filter((interest) => interest !== value);
+    setInterests(next);
+    localStorage.setItem(INTERESTS_STORAGE_KEY, JSON.stringify(next));
+  }
+
   if (!activeGroup || remainingItems === 0) {
     return (
       <div className="flex flex-1 items-center justify-center bg-slate-50 px-6">
@@ -145,6 +186,60 @@ export default function DigestView({ digest }: Props) {
               Restore dismissed
             </button>
           )}
+        </div>
+
+        <div className="border-b border-slate-200 px-4 py-4">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-xs font-semibold uppercase text-slate-500">Sort</p>
+            <SlidersHorizontal className="h-4 w-4 text-slate-400" />
+          </div>
+          <div className="grid grid-cols-2 rounded-md bg-slate-100 p-1">
+            {(["priority", "recency"] as SortMode[]).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setSortMode(mode)}
+                className={`rounded px-2 py-1.5 text-xs font-semibold capitalize ${
+                  sortMode === mode ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="border-b border-slate-200 px-4 py-4">
+          <p className="mb-3 text-xs font-semibold uppercase text-slate-500">Interests</p>
+          <div className="flex flex-wrap gap-2">
+            {interests.map((interest) => (
+              <button
+                key={interest}
+                onClick={() => removeInterest(interest)}
+                className="rounded bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100"
+                title="Remove interest"
+              >
+                {interest}
+              </button>
+            ))}
+          </div>
+          <div className="mt-3 flex gap-2">
+            <input
+              value={interestDraft}
+              onChange={(event) => setInterestDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") addInterest();
+              }}
+              className="min-w-0 flex-1 rounded-md border border-slate-200 px-2 py-1.5 text-sm outline-none focus:border-slate-400"
+              placeholder="Add topic"
+            />
+            <button
+              onClick={addInterest}
+              className="rounded-md border border-slate-200 px-2 text-slate-600 hover:bg-slate-50"
+              title="Add interest"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         <nav className="flex gap-2 overflow-x-auto px-3 py-3 xl:block xl:space-y-1 xl:overflow-y-auto">
@@ -239,6 +334,12 @@ function Metric({ label, value }: { label: string; value: number }) {
 }
 
 function MessagePreview({ item, onDismiss }: { item: DigestItem; onDismiss: () => void }) {
+  function runAction(prompt: string) {
+    const encoded = encodeURIComponent(prompt);
+    window.open(`https://app.glean.com/chat?query=${encoded}`, "_blank");
+    logEvent("action_selected", { itemId: item.id, prompt });
+  }
+
   return (
     <div className="flex h-full min-h-[360px] flex-col">
       <div className="border-b border-slate-200 bg-white px-5 py-4">
@@ -259,7 +360,13 @@ function MessagePreview({ item, onDismiss }: { item: DigestItem; onDismiss: () =
 
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
         <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
-          <p className="whitespace-pre-wrap text-sm leading-7 text-slate-800">{item.preview}</p>
+          <p className="text-xs font-semibold uppercase text-slate-500">Original excerpt</p>
+          <p className="mt-2 whitespace-pre-wrap text-sm leading-7 text-slate-800">{item.rawExcerpt || item.fullText || item.preview}</p>
+        </div>
+
+        <div className="mt-4 rounded-md border border-slate-200 bg-white p-4 shadow-sm">
+          <p className="text-xs font-semibold uppercase text-slate-500">Thread summary</p>
+          <p className="mt-2 whitespace-pre-wrap text-sm leading-7 text-slate-800">{item.threadSummary || item.fullText || item.preview}</p>
         </div>
 
         {item.reason && (
@@ -268,22 +375,85 @@ function MessagePreview({ item, onDismiss }: { item: DigestItem; onDismiss: () =
             <p className="mt-2 text-sm leading-6 text-amber-950">{item.reason}</p>
           </div>
         )}
+
+        {item.scoreExplanation && (
+          <div className="mt-4 rounded-md border border-blue-200 bg-blue-50 p-4">
+            <p className="text-xs font-semibold uppercase text-blue-700">Priority score</p>
+            <p className="mt-2 text-sm leading-6 text-blue-950">
+              {item.rankingScore ?? 0} · {item.scoreExplanation}
+            </p>
+          </div>
+        )}
+
+        {item.suggestedActions?.length ? (
+          <div className="mt-4 rounded-md border border-slate-200 bg-white p-4 shadow-sm">
+            <p className="text-xs font-semibold uppercase text-slate-500">Suggested next steps</p>
+            <div className="mt-3 space-y-2">
+              {item.suggestedActions.map((action) => (
+                <button
+                  key={action.id}
+                  onClick={() => runAction(action.prompt)}
+                  className="block w-full rounded-md border border-slate-200 px-3 py-2 text-left hover:bg-slate-50"
+                >
+                  <span className="text-sm font-semibold text-slate-900">{action.label}</span>
+                  <span className="mt-1 block text-xs leading-5 text-slate-500">{action.rationale}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <div className="border-t border-slate-200 bg-white px-5 py-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="text-xs text-slate-500">
-            {item.author ? <span>{item.author}</span> : null}
-            {item.timestamp ? <span>{item.author ? " · " : ""}{item.timestamp}</span> : null}
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+            {item.channel && (
+              item.channelUrl ? (
+                <a
+                  href={item.channelUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-1 font-medium text-slate-600 hover:bg-slate-200"
+                >
+                  <Hash className="h-3 w-3" />
+                  {item.channel}
+                </a>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-1 font-medium text-slate-600">
+                  <Hash className="h-3 w-3" />
+                  {item.channel}
+                </span>
+              )
+            )}
+            {item.author && (
+              item.authorUrl ? (
+                <a
+                  href={item.authorUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-1 font-medium text-slate-600 hover:bg-slate-200"
+                >
+                  <User className="h-3 w-3" />
+                  {item.author}
+                </a>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-1 font-medium text-slate-600">
+                  <User className="h-3 w-3" />
+                  {item.author}
+                </span>
+              )
+            )}
+            {item.timestamp ? <span>{formatDisplayTime(item.timestamp)}</span> : null}
           </div>
           {item.url && (
             <a
               href={item.url}
               target="_blank"
               rel="noreferrer"
+              onClick={() => logEvent("go_to_slack_clicked", { itemId: item.id, url: item.url })}
               className="inline-flex items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
             >
-              Open in Slack
+              Open message in Slack
               <ExternalLink className="h-4 w-4" />
             </a>
           )}
@@ -295,4 +465,59 @@ function MessagePreview({ item, onDismiss }: { item: DigestItem; onDismiss: () =
 
 function getItemKey(item: DigestItem) {
   return item.url || `${item.channel ?? "unknown"}:${item.timestamp ?? ""}:${item.title}`;
+}
+
+function formatDisplayTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime()) || date.getUTCFullYear() <= 1971) {
+    return "";
+  }
+
+  return formatDistanceToNow(date, { addSuffix: true });
+}
+
+function rankItems(items: DigestItem[], sortMode: SortMode, interests: string[]) {
+  return [...items].sort((a, b) => {
+    if (sortMode === "recency") {
+      return getTimeValue(b.latestActivityTimestamp ?? b.timestamp) - getTimeValue(a.latestActivityTimestamp ?? a.timestamp);
+    }
+
+    return getPriorityScore(b, interests) - getPriorityScore(a, interests);
+  });
+}
+
+function getPriorityScore(item: DigestItem, interests: string[]) {
+  const text = `${item.title} ${item.channel ?? ""} ${item.summary ?? ""} ${item.fullText ?? ""}`.toLowerCase();
+  const interestBoost = interests.filter((interest) => text.includes(interest.toLowerCase())).length * 6;
+  const suppressionPenalty = item.isSuppressed ? 10 : 0;
+  return (item.rankingScore ?? 0) + interestBoost - suppressionPenalty;
+}
+
+function getTimeValue(value?: string) {
+  if (!value) return 0;
+  const time = new Date(value).getTime();
+  return Number.isNaN(time) ? 0 : time;
+}
+
+function inferInterestsFromDigest(digest: DigestData) {
+  const counts = new Map<string, number>();
+
+  for (const group of digest.groups) {
+    for (const item of group.items) {
+      for (const topic of item.topics ?? []) {
+        counts.set(topic, (counts.get(topic) ?? 0) + 1);
+      }
+    }
+  }
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([topic]) => topic);
+}
+
+function logEvent(name: string, payload: Record<string, unknown>) {
+  console.info("[SlackDigest]", name, {
+    ...payload,
+    at: new Date().toISOString(),
+  });
 }

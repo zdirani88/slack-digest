@@ -1,7 +1,7 @@
 "use client";
 
 import { DigestItem } from "@/types";
-import { Archive, Clock, Hash, User } from "lucide-react";
+import { Archive, Clock, Hash, MessageSquare, Repeat2, ThumbsUp, User } from "lucide-react";
 import { formatDistanceToNow, parseISO } from "date-fns";
 import { ReactNode } from "react";
 
@@ -15,13 +15,20 @@ interface Props {
 function tryFormatTime(ts?: string): string {
   if (!ts) return "";
   try {
-    return formatDistanceToNow(parseISO(ts), { addSuffix: true });
+    const date = parseISO(ts);
+    if (Number.isNaN(date.getTime()) || date.getUTCFullYear() <= 1971) {
+      return "";
+    }
+
+    return formatDistanceToNow(date, { addSuffix: true });
   } catch {
-    return ts;
+    return "";
   }
 }
 
 export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Props) {
+  const contentSummary = item.threadSummary || item.preview || item.rawExcerpt || item.fullText || "";
+
   return (
     <article
       className={`rounded-md border bg-white shadow-sm transition-colors ${
@@ -42,8 +49,8 @@ export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Pr
       >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="line-clamp-2 text-sm font-semibold leading-5 text-slate-950">{item.title}</p>
-            <p className="mt-1 line-clamp-2 text-sm leading-5 text-slate-500">{item.preview}</p>
+            <p className="line-clamp-1 text-sm font-semibold leading-5 text-slate-950">{item.summary || item.title}</p>
+            <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-500">{contentSummary}</p>
           </div>
           <button
             onClick={(event) => {
@@ -65,9 +72,18 @@ export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Pr
           {item.author && (
             <MetaChip icon={<User className="h-3 w-3" />} label={item.author} />
           )}
-          {item.timestamp && (
+          {tryFormatTime(item.timestamp) && (
             <MetaChip icon={<Clock className="h-3 w-3" />} label={tryFormatTime(item.timestamp)} />
           )}
+          {item.signals?.replies ? (
+            <MetaChip icon={<MessageSquare className="h-3 w-3" />} label={`${item.signals.replies} replies`} />
+          ) : null}
+          {item.signals?.reactions ? (
+            <MetaChip icon={<ThumbsUp className="h-3 w-3" />} label={`${item.signals.reactions} reactions`} />
+          ) : null}
+          {item.signals?.forwards ? (
+            <MetaChip icon={<Repeat2 className="h-3 w-3" />} label={`${item.signals.forwards} reposts`} />
+          ) : null}
         </div>
       </div>
     </article>

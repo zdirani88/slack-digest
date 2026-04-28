@@ -13,7 +13,9 @@ export interface GleanAuthor {
 
 export interface GleanDocumentMetadata {
   datasource?: string;
+  datasourceInstance?: string;
   container?: string;
+  containerId?: string;
   containerUrl?: string;
   updateTime?: string;
   createTime?: string;
@@ -55,11 +57,44 @@ export interface DigestItem {
   title: string;
   channel?: string;
   channelUrl?: string;
+  channelId?: string;
+  summary?: string;
   preview: string;
+  rawExcerpt?: string;
+  threadSummary?: string;
+  fullText?: string;
   url?: string;
   reason?: string;
   timestamp?: string;
+  originalTimestamp?: string;
+  latestActivityTimestamp?: string;
   author?: string;
+  authorUrl?: string;
+  rankingScore?: number;
+  scoreExplanation?: string;
+  signals?: DigestSignals;
+  suggestedActions?: DigestAction[];
+  topics?: string[];
+  isSuppressed?: boolean;
+  suppressionReason?: string;
+}
+
+export interface DigestSignals {
+  replies: number;
+  reactions: number;
+  forwards: number;
+  engagement: number;
+  affinity: number;
+  freshness: number;
+  visibility: number;
+  noisePenalty: number;
+}
+
+export interface DigestAction {
+  id: string;
+  label: string;
+  prompt: string;
+  rationale: string;
 }
 
 export interface DigestGroup {
