@@ -8,8 +8,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing headers" }, { status: 400 });
   }
 
+  const searchUrl = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/search`;
+
   try {
-    const res = await fetch(`${backendUrl.replace(/\/$/, "")}/api/v1/search`, {
+    const res = await fetch(searchUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
