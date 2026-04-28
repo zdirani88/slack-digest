@@ -7,7 +7,7 @@ import { AlertCircle, ExternalLink } from "lucide-react";
 export default function SetupPage() {
   const router = useRouter();
   const [token, setToken] = useState("");
-  const [backendUrl, setBackendUrl] = useState("https://scio-prod-be.glean.com");
+  const [backendUrl, setBackendUrl] = useState(process.env.NEXT_PUBLIC_GLEAN_BACKEND_URL ?? "https://scio-prod-be.glean.com");
   const [error, setError] = useState("");
   const [testing, setTesting] = useState(false);
 

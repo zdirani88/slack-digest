@@ -1,0 +1,14 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_GLEAN_BACKEND_URL=${NEXT_PUBLIC_GLEAN_BACKEND_URL:-https://scio-prod-be.glean.com}
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    environment:
+      - NEXT_PUBLIC_GLEAN_BACKEND_URL=${NEXT_PUBLIC_GLEAN_BACKEND_URL:-https://scio-prod-be.glean.com}
+    restart: unless-stopped

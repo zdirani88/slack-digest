@@ -2,5 +2,8 @@ node_modules/
 .next/
 .DS_Store
 src/.DS_Store
-.claude/worktrees/
+.claude/
 tsconfig.tsbuildinfo
+.env
+.env.local
+.env*.local

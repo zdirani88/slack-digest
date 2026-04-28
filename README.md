@@ -2,7 +2,23 @@
 
 A local Mac app that pulls recent Slack activity through Glean and presents it as a grouped, scannable digest.
 
-## Setup
+## Prerequisites
+
+- [Node.js 20+](https://nodejs.org) (for local dev)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop) **or** [Colima](https://github.com/abiosoft/colima) (free Docker runtime for macOS) and Docker Compose (for containerized run)
+- A Glean API token (see [Getting your Glean API token](#getting-your-glean-api-token))
+
+## Running with Docker Compose
+
+```bash
+cd slack-digest
+touch .env.local
+docker compose up --build
+```
+
+Then open [http://localhost:3000](http://localhost:3000).
+
+## Running locally
 
 ```bash
 cd slack-digest

@@ -19,7 +19,7 @@ export async function searchSlack(
   token: string,
   backendUrl: string
 ): Promise<GleanSearchResult[]> {
-  const url = `${backendUrl.replace(/\/$/, "")}/api/v1/search`;
+  const url = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/search`;
   const timeRange = getTimeRange(timeWindow);
   const queries = [
     { query: "", pages: 2 },
@@ -162,7 +162,7 @@ Only put each item in the single most relevant group.
 Messages:
 ${JSON.stringify(aiMessages, null, 2)}`;
 
-  const chatUrl = `${backendUrl.replace(/\/$/, "")}/api/v1/chat`;
+  const chatUrl = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/chat`;
 
   let parsed: { groups: DigestGroup[] };
   try {
