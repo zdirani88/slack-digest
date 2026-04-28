@@ -124,6 +124,30 @@ export interface DigestData {
   totalItems: number;
 }
 
+export interface BriefingStory {
+  id: string;
+  section: string;
+  headline: string;
+  dek: string;
+  body: string[];
+  whyItMatters: string;
+  nextStep?: string;
+  people: string[];
+  channels: Array<{ name: string; url?: string }>;
+  slackUrls: string[];
+  score: number;
+  sourceItemIds: string[];
+}
+
+export interface BriefingData {
+  generatedAt: string;
+  timeWindow: TimeWindow;
+  leadStory?: BriefingStory;
+  secondaryStories: BriefingStory[];
+  sections: Array<{ id: string; title: string; stories: BriefingStory[] }>;
+  totalStories: number;
+}
+
 export interface GleanConfig {
   token: string;
   backendUrl: string;

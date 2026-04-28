@@ -4,7 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { DigestData, TimeWindow } from "@/types";
 import DigestView from "@/components/DigestView";
-import { RefreshCw, LogOut, Clock } from "lucide-react";
+import { fetchDigest, formatErrorMessage } from "@/lib/clientDigest";
+import { RefreshCw, LogOut, Clock, Newspaper } from "lucide-react";
 
 const TIME_WINDOW_LABELS: Record<TimeWindow, string> = {
   "24h": "Last 24 hours",
@@ -21,36 +22,13 @@ export default function DigestPage() {
 
   const generate = useCallback(
     async (tw: TimeWindow) => {
-      const token = localStorage.getItem("glean_token");
-      const backendUrl = localStorage.getItem("glean_backend_url");
-      if (!token || !backendUrl) {
-        router.replace("/setup");
-        return;
-      }
-
       setLoading(true);
       setError("");
 
       try {
-        const res = await fetch("/api/digest/generate", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-glean-token": token,
-            "x-glean-backend": backendUrl,
-          },
-          body: JSON.stringify({ timeWindow: tw }),
-        });
-
-        const data = await res.json();
-        if (!res.ok) {
-          setError(formatErrorMessage(data.error));
-          return;
-        }
-
-        setDigest(data);
-      } catch {
-        setError("Network error. Is the dev server running, and can it reach Glean?");
+        setDigest(await fetchDigest({ timeWindow: tw, router }));
+      } catch (error) {
+        setError(error instanceof Error ? error.message : "Network error. Is the dev server running, and can it reach Glean?");
       } finally {
         setLoading(false);
       }
@@ -108,6 +86,14 @@ export default function DigestPage() {
           </div>
 
           <button
+            onClick={() => router.push("/briefing")}
+            className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-stone-600 transition-colors hover:bg-stone-100"
+          >
+            <Newspaper className="h-3.5 w-3.5" />
+            Briefing
+          </button>
+
+          <button
             onClick={() => generate(timeWindow)}
             disabled={loading}
             className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-stone-600 transition-colors hover:bg-stone-100 disabled:opacity-50"
@@ -163,16 +149,4 @@ export default function DigestPage() {
       </div>
     </div>
   );
-}
-
-function formatErrorMessage(error: unknown) {
-  if (typeof error !== "string" || error.trim().length === 0) {
-    return "Failed to generate digest.";
-  }
-
-  if (error === "fetch failed") {
-    return "Could not reach Glean. Check your network connection or backend URL and try again.";
-  }
-
-  return error;
 }
