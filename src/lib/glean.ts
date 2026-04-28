@@ -29,8 +29,17 @@ export async function searchSlack(
     { query: "incident", pages: 2 },
     { query: "regression", pages: 1 },
     { query: "debug", pages: 1 },
+    { query: "architecture", pages: 1 },
+    { query: "technical design", pages: 1 },
+    { query: "implementation", pages: 1 },
+    { query: "infra", pages: 1 },
+    { query: "deployment", pages: 1 },
     { query: "launch", pages: 1 },
-    { query: "idea", pages: 1 },
+    { query: "idea", pages: 2 },
+    { query: "brainstorm", pages: 1 },
+    { query: "experiment", pages: 1 },
+    { query: "prototype", pages: 1 },
+    { query: "what if", pages: 1 },
     { query: "deal", pages: 2 },
     { query: "pipeline", pages: 1 },
     { query: "prospect", pages: 1 },
@@ -119,16 +128,17 @@ export async function generateDigestViaGleanChat(
 
   const prompt = `You are a Slack digest assistant for Zubin. Below are ${aiMessages.length} Slack messages/threads from the past ${timeLabels[timeWindow]}.
 
-Organize them into these 7 categories. Return ONLY valid JSON, no markdown fences, no explanation.
+Organize them into these 8 categories. Return ONLY valid JSON, no markdown fences, no explanation.
 
 Categories:
-- system_issues: Incidents, regressions, bugs, outages, latency, failures, security issues, debugging, root cause analysis
+- system_issues: Human discussion about important incidents, regressions, bugs, outages, failures, security issues, debugging, root cause analysis
+- automated_alerts: Bot/app/system generated alerts, escalation forms, monitoring posts, Jira/GitHub/PagerDuty/Sentry style notifications
 - product_updates: Product launches, roadmap movement, feature changes, customer-facing product news
 - engineering_updates: Architecture, implementation, infra projects, technical design, non-incident engineering updates
 - ideas_and_innovations: Brainstorms, experiments, feature ideas, AI concepts, open-ended ideation
 - sales_updates: Pipeline, deals, prospects, revenue discussions, enablement, field asks
 - partnership_updates: Partners, partner launches, NVIDIA, customers, vendors, joint work, external collaboration
-- leadership_attention: Direct asks to Zubin, VIP/executive mentions, urgent decisions, leadership-visible items that are not primarily system issues
+- leadership_attention: Direct asks to Zubin, VIP/executive mentions, urgent decisions, leadership-visible items that are not primarily system issues or automated alerts
 
 JSON format:
 {
@@ -155,9 +165,13 @@ JSON format:
   ]
 }
 
-Use these exact group ids: leadership_attention, system_issues, product_updates, engineering_updates, ideas_and_innovations, sales_updates, partnership_updates.
-Include all 7 groups even if empty (empty items array).
+Use these exact group ids: leadership_attention, system_issues, automated_alerts, product_updates, engineering_updates, ideas_and_innovations, sales_updates, partnership_updates.
+Include all 8 groups even if empty (empty items array).
 Only put each item in the single most relevant group.
+Do not put bot/app generated system posts in leadership_attention. Put those in automated_alerts.
+If a human on Zubin's team, a VIP, or a key leader is discussing an incident or regression, put it in system_issues.
+Put technical design, architecture, implementation, infra, migration, API, backend/frontend, database, schema, performance, or release execution in engineering_updates unless it is primarily an incident.
+Put brainstorms, experiments, prototypes, proposals, "what if", "could we", and feature ideas in ideas_and_innovations even when the topic is product-adjacent.
 
 Messages:
 ${JSON.stringify(aiMessages, null, 2)}`;
@@ -222,12 +236,13 @@ ${JSON.stringify(aiMessages, null, 2)}`;
 
 const GROUP_META: Array<{ id: string; title: string; emoji: string; priority: number }> = [
   { id: "leadership_attention", title: "Leadership Attention", emoji: "⚠️", priority: 1 },
-  { id: "system_issues", title: "System Issues", emoji: "🧯", priority: 2 },
-  { id: "product_updates", title: "Product Updates", emoji: "🚀", priority: 3 },
-  { id: "engineering_updates", title: "Engineering Updates", emoji: "🛠️", priority: 4 },
-  { id: "ideas_and_innovations", title: "Ideas & Innovation", emoji: "💡", priority: 5 },
-  { id: "sales_updates", title: "Sales Updates", emoji: "📈", priority: 6 },
-  { id: "partnership_updates", title: "Partnership Updates", emoji: "🤝", priority: 7 },
+  { id: "system_issues", title: "Team Escalations", emoji: "🧯", priority: 2 },
+  { id: "automated_alerts", title: "Automated Alerts", emoji: "🤖", priority: 3 },
+  { id: "product_updates", title: "Product Updates", emoji: "🚀", priority: 4 },
+  { id: "engineering_updates", title: "Engineering Updates", emoji: "🛠️", priority: 5 },
+  { id: "ideas_and_innovations", title: "Ideas & Innovation", emoji: "💡", priority: 6 },
+  { id: "sales_updates", title: "Sales Updates", emoji: "📈", priority: 7 },
+  { id: "partnership_updates", title: "Partnership Updates", emoji: "🤝", priority: 8 },
 ];
 
 function ensureAllGroups(incoming: DigestGroup[]): DigestGroup[] {
@@ -385,22 +400,25 @@ function prioritizeMessages(
 
 function scoreMessage(message: {
   title: string;
+  author: string;
   channel: string;
   content: string;
   timestamp: string;
 }) {
-  const haystack = `${message.title} ${message.channel} ${message.content}`.toLowerCase();
+  const haystack = `${message.title} ${message.channel} ${message.author ?? ""} ${message.content}`.toLowerCase();
   let score = 0;
-  const vipTerms = ["arvind", "jensen", "ceo"];
 
   if (haystack.includes("@")) score += 6;
   if (haystack.includes("urgent") || haystack.includes("asap") || haystack.includes("blocker")) score += 6;
+  if (isHumanSystemDiscussion(message)) score += 8;
+  if (isAutomatedAlert(message)) score -= 4;
   if (isSystemIssueText(haystack) || haystack.includes("launch")) score += 5;
+  if (isEngineeringUpdateText(haystack)) score += 5;
+  if (isIdeaText(haystack)) score += 5;
   if (isSalesText(haystack) || isPartnershipText(haystack)) score += 4;
-  if (haystack.includes("idea") || haystack.includes("ai") || haystack.includes("prototype")) score += 3;
   if (haystack.includes("thread between") || haystack.includes("thread_ts")) score += 5;
   if (haystack.includes("dm") || haystack.includes("direct message")) score += 4;
-  if (vipTerms.some((term) => haystack.includes(term))) score += 8;
+  if (isVipOrLeaderText(haystack)) score += 8;
   if (message.timestamp) score += 1;
 
   return score;
@@ -473,12 +491,35 @@ function chooseGroup(message: {
   channel: string;
   author: string;
 }) {
-  const haystack = `${message.title} ${message.content}`.toLowerCase();
+  const haystack = `${message.title} ${message.author} ${message.content}`.toLowerCase();
+
+  if (isAutomatedAlert(message)) {
+    return {
+      id: "automated_alerts",
+      reason: "This appears to be generated by an app, bot, or monitoring workflow, so it is separated from human issue discussion.",
+    };
+  }
 
   if (isSystemIssueText(haystack)) {
     return {
       id: "system_issues",
-      reason: "This looks like an incident, bug, regression, or debugging thread that should be separated from leadership asks.",
+      reason: isHumanSystemDiscussion(message)
+        ? "A human team member or leader is discussing an incident, bug, regression, or debugging thread."
+        : "This is a human-readable system issue discussion rather than a generated alert.",
+    };
+  }
+
+  if (isIdeaText(haystack)) {
+    return {
+      id: "ideas_and_innovations",
+      reason: "This message is centered on a brainstorm, experiment, prototype, or exploratory product/AI idea.",
+    };
+  }
+
+  if (isEngineeringUpdateText(haystack)) {
+    return {
+      id: "engineering_updates",
+      reason: "This thread looks like technical design, implementation, architecture, infrastructure, or release execution.",
     };
   }
 
@@ -528,39 +569,55 @@ function chooseGroup(message: {
     };
   }
 
-  if (
-    haystack.includes("infra") ||
-    haystack.includes("deployment") ||
-    haystack.includes("architecture") ||
-    haystack.includes("implementation") ||
-    haystack.includes("technical design") ||
-    haystack.includes("engineering")
-  ) {
-    return {
-      id: "engineering_updates",
-      reason: "This thread looks like engineering work, architecture, infrastructure, or release execution.",
-    };
-  }
-
-  if (
-    haystack.includes("idea") ||
-    haystack.includes("brainstorm") ||
-    haystack.includes("experiment") ||
-    haystack.includes("prototype") ||
-    haystack.includes("agent") ||
-    haystack.includes("ai") ||
-    haystack.includes("what if")
-  ) {
-    return {
-      id: "ideas_and_innovations",
-      reason: "This message feels exploratory, inventive, or centered on a new idea worth tracking.",
-    };
-  }
-
   return {
     id: "product_updates",
     reason: "This is informational but appears closest to the broader product narrative.",
   };
+}
+
+function isEngineeringUpdateText(value: string) {
+  return [
+    "architecture",
+    "technical design",
+    "implementation",
+    "infra",
+    "deployment",
+    "engineering",
+    "migration",
+    "refactor",
+    "api",
+    "backend",
+    "frontend",
+    "database",
+    "schema",
+    "performance",
+    "scalability",
+    "release train",
+    "code review",
+    "pr ",
+    "pull request",
+  ].some((term) => value.includes(term));
+}
+
+function isIdeaText(value: string) {
+  return [
+    "idea",
+    "brainstorm",
+    "experiment",
+    "prototype",
+    "what if",
+    "proposal",
+    "concept",
+    "explore",
+    "exploration",
+    "hypothesis",
+    "agent idea",
+    "feature idea",
+    "future",
+    "could we",
+    "should we",
+    "would it be possible",
+  ].some((term) => value.includes(term));
 }
 
 function isSystemIssueText(value: string) {
@@ -576,12 +633,93 @@ function isSystemIssueText(value: string) {
     "failed",
     "error",
     "broken",
-    "blocker",
-    "escalation",
     "security",
     "sev",
     "p0",
     "p1",
+  ].some((term) => value.includes(term));
+}
+
+function isAutomatedAlert(message: {
+  title: string;
+  content: string;
+  channel: string;
+  author: string;
+}) {
+  const author = message.author.toLowerCase();
+  const text = `${message.title} ${message.channel} ${message.content}`.toLowerCase();
+
+  if (
+    author.includes("app") ||
+    author.includes("bot") ||
+    author.includes("jira") ||
+    author.includes("github") ||
+    author.includes("pagerduty") ||
+    author.includes("sentry") ||
+    author.includes("datadog") ||
+    author.includes("buildkite") ||
+    author.includes("jenkins")
+  ) {
+    return true;
+  }
+
+  return [
+    "escalation raised by",
+    "created a tracking jira",
+    "view the escalation",
+    "resolve button",
+    "resolve with autofill",
+    "automated",
+    "workflow",
+    "alert:",
+    "monitoring",
+    "opened issue",
+    "opened pr",
+    "status changed",
+    "new relic",
+  ].some((term) => text.includes(term));
+}
+
+function isHumanSystemDiscussion(message: {
+  title: string;
+  content: string;
+  channel: string;
+  author: string;
+}) {
+  const text = `${message.title} ${message.channel} ${message.author} ${message.content}`.toLowerCase();
+  return !isAutomatedAlert(message) && (isVipOrLeaderText(text) || isTeamDiscussionText(text));
+}
+
+function isVipOrLeaderText(value: string) {
+  return [
+    "arvind",
+    "jensen",
+    "ceo",
+    "cto",
+    "cpo",
+    "founder",
+    "exec",
+    "leadership",
+    "vp ",
+    "svp",
+  ].some((term) => value.includes(term));
+}
+
+function isTeamDiscussionText(value: string) {
+  return [
+    "@zubin",
+    "zubin",
+    "team",
+    "oncall",
+    "dri",
+    "taking a look",
+    "can you",
+    "please look",
+    "need help",
+    "blocked",
+    "blocker",
+    "release testing",
+    "ftr",
   ].some((term) => value.includes(term));
 }
 
