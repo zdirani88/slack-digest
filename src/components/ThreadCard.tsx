@@ -67,7 +67,7 @@ export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Pr
 
         <div className="mt-3 flex flex-wrap gap-1.5">
           {item.channel && (
-            <MetaChip icon={<Hash className="h-3 w-3" />} label={item.channel} />
+            <MetaChip icon={<Hash className="h-3 w-3" />} label={item.channel} href={item.channelUrl} />
           )}
           {item.author && (
             <MetaChip icon={<User className="h-3 w-3" />} label={item.author} />
@@ -90,7 +90,22 @@ export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Pr
   );
 }
 
-function MetaChip({ icon, label }: { icon: ReactNode; label: string }) {
+function MetaChip({ icon, label, href }: { icon: ReactNode; label: string; href?: string }) {
+  if (href) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(event) => event.stopPropagation()}
+        className="inline-flex max-w-full items-center gap-1 rounded bg-slate-100 px-1.5 py-1 text-xs font-medium text-slate-500 hover:bg-slate-200 hover:text-slate-700"
+      >
+        {icon}
+        <span className="truncate">{label}</span>
+      </a>
+    );
+  }
+
   return (
     <span className="inline-flex max-w-full items-center gap-1 rounded bg-slate-100 px-1.5 py-1 text-xs font-medium text-slate-500">
       {icon}

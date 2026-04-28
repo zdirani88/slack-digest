@@ -77,6 +77,7 @@ export interface DigestItem {
   topics?: string[];
   isSuppressed?: boolean;
   suppressionReason?: string;
+  graphContext?: DigestGraphContext;
 }
 
 export interface DigestSignals {
@@ -88,6 +89,16 @@ export interface DigestSignals {
   freshness: number;
   visibility: number;
   noisePenalty: number;
+  graph: number;
+}
+
+export interface DigestGraphContext {
+  score: number;
+  recommendationCount: number;
+  feedMatchCount: number;
+  peopleBoost: number;
+  relatedTitles: string[];
+  notes: string[];
 }
 
 export interface DigestAction {

@@ -7,6 +7,7 @@ import {
   DigestItem,
   DigestSignals,
   DigestAction,
+  DigestGraphContext,
 } from "@/types";
 
 export function getTimeRange(window: TimeWindow) {
@@ -16,6 +17,7 @@ export function getTimeRange(window: TimeWindow) {
 }
 
 const GLEAN_TIMEOUT_MS = 25000;
+const OPTIONAL_GLEAN_TIMEOUT_MS = 5000;
 
 type MessageCandidate = {
   id: string;
@@ -31,6 +33,7 @@ type MessageCandidate = {
   authorUrl: string;
   content: string;
   signals: DigestSignals;
+  graphContext: DigestGraphContext;
 };
 
 type AiDigestEnrichment = {
@@ -38,6 +41,12 @@ type AiDigestEnrichment = {
   threadSummary?: string;
   reason?: string;
   suggestedActions?: DigestAction[];
+};
+
+type GraphSeed = {
+  text: string;
+  urls: Set<string>;
+  titles: Set<string>;
 };
 
 export async function searchSlack(
@@ -132,7 +141,9 @@ export async function generateDigestViaGleanChat(
   };
 
   const messages: MessageCandidate[] = results.map((r, i) => {
-    const messageUrl = r.nativeAppUrl ?? r.url ?? "";
+    const webUrl = r.url ?? "";
+    const appUrl = r.nativeAppUrl ?? "";
+    const messageUrl = webUrl || appUrl;
     const originalTimestamp = normalizeTimestamp(r.document?.metadata?.createTime);
     const latestActivityTimestamp = normalizeTimestamp(
       r.document?.metadata?.updateTime,
@@ -143,7 +154,7 @@ export async function generateDigestViaGleanChat(
       id: `item_${i}`,
       title: r.title ?? "Untitled",
       channel: r.document?.metadata?.container ?? "unknown",
-      channelUrl: r.document?.metadata?.containerUrl ?? deriveSlackChannelUrl(messageUrl),
+      channelUrl: r.document?.metadata?.containerUrl ?? deriveSlackChannelUrl(webUrl || appUrl),
       channelId: r.document?.metadata?.containerId ?? "",
       author: r.document?.metadata?.author?.name ?? "unknown",
       timestamp: latestActivityTimestamp,
@@ -153,11 +164,25 @@ export async function generateDigestViaGleanChat(
       authorUrl: "",
       content: extractSlackContent(r),
       signals: inferSignals(r),
+      graphContext: emptyGraphContext(),
     };
   });
 
   // Keep the AI prompt bounded even when retrieval gets much broader.
-  const aiMessages = prioritizeMessages(messages).slice(0, 80);
+  const initialCandidates = prioritizeMessages(messages).slice(0, 80);
+  const graphContexts = await fetchGraphContexts(initialCandidates, token, backendUrl);
+  const graphMessages = messages.map((message) => {
+    const graphContext = graphContexts.get(message.id) ?? emptyGraphContext();
+    return {
+      ...message,
+      graphContext,
+      signals: {
+        ...message.signals,
+        graph: graphContext.score,
+      },
+    };
+  });
+  const aiMessages = prioritizeMessages(graphMessages).slice(0, 80);
   const itemEnrichments = await generateItemEnrichmentsViaGleanChat(
     aiMessages,
     token,
@@ -225,7 +250,7 @@ If a human on Zubin's team, a VIP, or a key leader is discussing an incident or 
 Put technical design, architecture, implementation, infra, migration, API, backend/frontend, database, schema, performance, or release execution in engineering_updates unless it is primarily an incident.
 Put brainstorms, experiments, prototypes, proposals, "what if", "could we", and feature ideas in ideas_and_innovations even when the topic is product-adjacent.
 
-Messages:
+Messages with graph context:
 ${JSON.stringify(aiMessages, null, 2)}`;
 
   const chatUrl = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/chat`;
@@ -267,7 +292,7 @@ ${JSON.stringify(aiMessages, null, 2)}`;
     const jsonText = extractJsonObject(rawText);
     parsed = JSON.parse(jsonText);
   } catch {
-    const fallbackGroups = buildFallbackGroups(messages, itemEnrichments);
+    const fallbackGroups = buildFallbackGroups(graphMessages, itemEnrichments);
     parsed = {
       groups: fallbackGroups.length > 0
         ? fallbackGroups
@@ -277,10 +302,10 @@ ${JSON.stringify(aiMessages, null, 2)}`;
 
   const groupsWithAllMessages = appendMissingMessages(
     parsed.groups ?? [],
-    messages,
+    graphMessages,
     itemEnrichments
   );
-  const groups = enrichGroups(ensureAllGroups(groupsWithAllMessages), messages, itemEnrichments);
+  const groups = enrichGroups(ensureAllGroups(groupsWithAllMessages), graphMessages, itemEnrichments);
   const totalItems = groups.reduce((sum, g) => sum + g.items.length, 0);
 
   return {
@@ -345,6 +370,8 @@ async function fetchSearchPage({
       datasourceFilter: "SLACK",
       pageSize: 60,
       timeRange,
+      returnLlmContentOverSnippets: true,
+      maxSnippetSize: 4000,
       ...(cursor ? { cursor } : {}),
     }),
   });
@@ -410,6 +437,189 @@ async function readErrorBody(res: Response) {
   } catch {
     return text;
   }
+}
+
+async function fetchGraphContexts(
+  messages: MessageCandidate[],
+  token: string,
+  backendUrl: string
+): Promise<Map<string, DigestGraphContext>> {
+  const feed = await fetchPersonalFeed(token, backendUrl).catch(() => emptyGraphSeed());
+  const limited = messages.slice(0, 40);
+  const entries = await Promise.all(
+    limited.map(async (message) => {
+      const [recommendations, peopleBoost] = await Promise.all([
+        fetchRecommendations(message, token, backendUrl).catch(() => []),
+        fetchPeopleBoost(message, token, backendUrl).catch(() => 0),
+      ]);
+      return [message.id, buildGraphContext(message, feed, recommendations, peopleBoost)] as const;
+    })
+  );
+
+  return new Map(entries);
+}
+
+async function fetchPersonalFeed(token: string, backendUrl: string): Promise<GraphSeed> {
+  const data = await fetchOptionalJson(`${backendUrl.replace(/\/$/, "")}/rest/api/v1/feed`, token, {
+    pageSize: 50,
+    categories: ["DOCUMENT_SUGGESTION", "RECENT", "TRENDING"],
+  });
+
+  return graphSeedFromUnknown(data);
+}
+
+async function fetchRecommendations(
+  message: MessageCandidate,
+  token: string,
+  backendUrl: string
+): Promise<string[]> {
+  if (!message.url) {
+    return [];
+  }
+
+  const data = await fetchOptionalJson(`${backendUrl.replace(/\/$/, "")}/rest/api/v1/recommenddocuments`, token, {
+    url: message.url,
+    document: { url: message.url },
+    pageSize: 8,
+  });
+  const seed = graphSeedFromUnknown(data);
+
+  return Array.from(seed.titles).slice(0, 5);
+}
+
+async function fetchPeopleBoost(
+  message: MessageCandidate,
+  token: string,
+  backendUrl: string
+): Promise<number> {
+  if (!message.author || message.author === "unknown") {
+    return 0;
+  }
+
+  const data = await fetchOptionalJson(`${backendUrl.replace(/\/$/, "")}/rest/api/v1/listentities`, token, {
+    query: message.author,
+    entityType: "PEOPLE",
+    requestOptions: { facetBucketSize: 5 },
+    pageSize: 5,
+  });
+  const text = normalizeText(JSON.stringify(data)).toLowerCase();
+  let boost = 0;
+
+  if (text.includes("executive") || text.includes("founder") || text.includes("vp") || text.includes("chief")) {
+    boost += 8;
+  }
+
+  if (text.includes("manager") || text.includes("lead") || text.includes("director")) {
+    boost += 4;
+  }
+
+  return boost;
+}
+
+async function fetchOptionalJson(url: string, token: string, body: Record<string, unknown>) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPTIONAL_GLEAN_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!res.ok) {
+    throw new Error(`Optional Glean context call failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
+function buildGraphContext(
+  message: MessageCandidate,
+  feed: GraphSeed,
+  relatedTitles: string[],
+  peopleBoost: number
+): DigestGraphContext {
+  const haystack = `${message.title} ${message.channel} ${message.author} ${message.content}`.toLowerCase();
+  const feedMatchCount = countFeedMatches(haystack, feed);
+  const recommendationCount = relatedTitles.length;
+  const score = Math.min(24, recommendationCount * 3 + feedMatchCount * 4 + peopleBoost);
+  const notes = [
+    recommendationCount > 0 ? `${recommendationCount} related Glean recommendation${recommendationCount === 1 ? "" : "s"}` : "",
+    feedMatchCount > 0 ? `${feedMatchCount} match${feedMatchCount === 1 ? "" : "es"} in personalized Glean feed context` : "",
+    peopleBoost > 0 ? "author appears important in Glean people context" : "",
+  ].filter(Boolean);
+
+  return {
+    score,
+    recommendationCount,
+    feedMatchCount,
+    peopleBoost,
+    relatedTitles,
+    notes,
+  };
+}
+
+function graphSeedFromUnknown(value: unknown): GraphSeed {
+  const seed = emptyGraphSeed();
+  collectGraphStrings(value, seed);
+  seed.text = Array.from(seed.titles).join(" ").toLowerCase();
+  return seed;
+}
+
+function collectGraphStrings(value: unknown, seed: GraphSeed) {
+  if (!value) return;
+
+  if (typeof value === "string") {
+    if (value.startsWith("http")) {
+      seed.urls.add(value);
+    } else if (value.length > 3 && value.length < 180) {
+      seed.titles.add(value);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectGraphStrings(entry, seed));
+    return;
+  }
+
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const title = normalizeText(record.title ?? record.name ?? record.displayName);
+    const url = normalizeText(record.url);
+
+    if (title) seed.titles.add(title);
+    if (url) seed.urls.add(url);
+
+    Object.values(record).forEach((entry) => collectGraphStrings(entry, seed));
+  }
+}
+
+function countFeedMatches(haystack: string, feed: GraphSeed) {
+  let matches = 0;
+  const terms = Array.from(feed.titles)
+    .flatMap((title) => title.toLowerCase().split(/[^a-z0-9]+/))
+    .filter((term) => term.length > 4);
+  const uniqueTerms = Array.from(new Set(terms)).slice(0, 120);
+
+  for (const term of uniqueTerms) {
+    if (haystack.includes(term)) matches += 1;
+  }
+
+  return Math.min(matches, 5);
+}
+
+function emptyGraphSeed(): GraphSeed {
+  return { text: "", urls: new Set(), titles: new Set() };
 }
 
 async function generateItemEnrichmentsViaGleanChat(
@@ -703,6 +913,7 @@ function scoreMessage(message: {
   channel: string;
   content: string;
   timestamp: string;
+  signals?: DigestSignals;
 }) {
   const haystack = `${message.title} ${message.channel} ${message.author ?? ""} ${message.content}`.toLowerCase();
   let score = 0;
@@ -719,6 +930,7 @@ function scoreMessage(message: {
   if (haystack.includes("dm") || haystack.includes("direct message")) score += 4;
   if (isVipOrLeaderText(haystack)) score += 8;
   if (message.timestamp) score += 1;
+  score += Math.min(16, message.signals?.graph ?? 0);
 
   return score;
 }
@@ -776,6 +988,7 @@ function buildFallbackGroups(
       topics,
       isSuppressed: score.isSuppressed,
       suppressionReason: score.suppressionReason,
+      graphContext: message.graphContext,
     };
 
     const bucket = chooseGroup(message);
@@ -884,6 +1097,7 @@ function enrichGroups(
           scoreExplanation: item.scoreExplanation ?? score.explanation,
           reason: enrichment?.reason ?? makeSpecificFallbackReason(message, score.explanation),
           signals: item.signals ?? message.signals,
+          graphContext: item.graphContext ?? message.graphContext,
           suggestedActions:
             enrichment?.suggestedActions ??
             item.suggestedActions ??
@@ -920,6 +1134,7 @@ function enrichStandaloneItem(item: DigestItem): DigestItem {
     scoreExplanation: item.scoreExplanation ?? score.explanation,
     reason: item.reason || score.explanation,
     signals,
+    graphContext: item.graphContext ?? emptyGraphContext(),
     suggestedActions: item.suggestedActions ?? suggestActions(item.title, content, item.channel ?? ""),
     topics,
     isSuppressed: item.isSuppressed ?? score.isSuppressed,
@@ -1219,6 +1434,7 @@ function inferSignals(result: GleanSearchResult): DigestSignals {
     freshness: 0,
     visibility: 0,
     noisePenalty: 0,
+    graph: 0,
   };
 }
 
@@ -1245,13 +1461,15 @@ function scoreDigestItem({
   const noisePenalty = getNoisePenalty(channel, haystack);
   const engagement = Math.min(24, signals.engagement);
   const forwards = Math.min(12, signals.forwards * 4);
-  const total = Math.round(engagement + affinity + freshness + visibility + forwards - noisePenalty);
+  const graph = Math.min(24, signals.graph);
+  const total = Math.round(engagement + affinity + freshness + visibility + forwards + graph - noisePenalty);
   const reasons = [
     engagement > 5 ? "high engagement" : "",
     affinity > 4 ? "matches inferred interests or VIP signals" : "",
     freshness > 12 ? "recent thread activity" : "",
     visibility > 4 ? "broad or important channel" : "",
     forwards > 0 ? "forwarded or reposted signal" : "",
+    graph > 0 ? "reinforced by Glean graph context" : "",
     noisePenalty > 0 ? "deweighted noisy channel" : "",
   ].filter(Boolean);
 
@@ -1356,6 +1574,18 @@ function emptySignals(): DigestSignals {
     freshness: 0,
     visibility: 0,
     noisePenalty: 0,
+    graph: 0,
+  };
+}
+
+function emptyGraphContext(): DigestGraphContext {
+  return {
+    score: 0,
+    recommendationCount: 0,
+    feedMatchCount: 0,
+    peopleBoost: 0,
+    relatedTitles: [],
+    notes: [],
   };
 }
 
