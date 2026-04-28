@@ -57,11 +57,11 @@ export async function searchSlack(
   const url = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/search`;
   const timeRange = getTimeRange(timeWindow);
   const queries = [
-    { query: "", pages: 2 },
-    { query: "@zubin", pages: 2 },
-    { query: "thread", pages: 1 },
+    { query: "", pages: 1, broad: true },
+    { query: "@zubin", pages: 1 },
+    { query: "thread", pages: 1, broad: true },
     { query: "urgent", pages: 1 },
-    { query: "incident", pages: 2 },
+    { query: "incident", pages: 1 },
     { query: "regression", pages: 1 },
     { query: "debug", pages: 1 },
     { query: "architecture", pages: 1 },
@@ -70,16 +70,16 @@ export async function searchSlack(
     { query: "infra", pages: 1 },
     { query: "deployment", pages: 1 },
     { query: "launch", pages: 1 },
-    { query: "idea", pages: 2 },
+    { query: "idea", pages: 1 },
     { query: "brainstorm", pages: 1 },
     { query: "experiment", pages: 1 },
     { query: "prototype", pages: 1 },
     { query: "what if", pages: 1 },
-    { query: "deal", pages: 2 },
+    { query: "deal", pages: 1 },
     { query: "pipeline", pages: 1 },
     { query: "prospect", pages: 1 },
     { query: "customer call", pages: 1 },
-    { query: "partner", pages: 2 },
+    { query: "partner", pages: 1 },
     { query: "partnership", pages: 1 },
     { query: "nvidia", pages: 1 },
     { query: "joint", pages: 1 },
@@ -88,8 +88,13 @@ export async function searchSlack(
 
   const collected: GleanSearchResult[] = [];
   const errors: string[] = [];
+  let hitRateLimit = false;
 
-  for (const { query, pages } of queries) {
+  for (const { query, pages, broad } of queries) {
+    if (hitRateLimit && broad) {
+      continue;
+    }
+
     let cursor: string | undefined;
 
     for (let page = 0; page < pages; page += 1) {
@@ -113,7 +118,10 @@ export async function searchSlack(
         cursor = data.cursor;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown Glean search error";
-        errors.push(`query="${query || "<blank>"}" page=${page + 1}: ${message}`);
+        if (isRateLimitError(message)) {
+          hitRateLimit = true;
+        }
+        errors.push(`query="${query || "<blank>"}" page=${page + 1}: ${summarizeSearchError(message)}`);
         break;
       }
     }
@@ -122,6 +130,10 @@ export async function searchSlack(
   const deduped = dedupeSlackResults(collected).slice(0, 180);
 
   if (deduped.length === 0 && errors.length > 0) {
+    if (hitRateLimit) {
+      throw new Error("Glean's Slack connector is rate limited right now. Wait about a minute, then refresh or use a narrower time window.");
+    }
+
     throw new Error(`Unable to load Slack search results. ${errors.slice(0, 3).join(" | ")}`);
   }
 
@@ -368,10 +380,10 @@ async function fetchSearchPage({
     body: JSON.stringify({
       query,
       datasourceFilter: "SLACK",
-      pageSize: 60,
+      pageSize: 35,
       timeRange,
       returnLlmContentOverSnippets: true,
-      maxSnippetSize: 4000,
+      maxSnippetSize: 2500,
       ...(cursor ? { cursor } : {}),
     }),
   });
@@ -415,6 +427,27 @@ function formatGleanErrorMessages(messages: unknown[]) {
     })
     .filter(Boolean)
     .join("; ");
+}
+
+function isRateLimitError(message: string) {
+  const text = message.toLowerCase();
+  return text.includes("429") || text.includes("rate limit") || text.includes("retry after");
+}
+
+function summarizeSearchError(message: string) {
+  const text = message
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (isRateLimitError(text)) {
+    const retry = text.match(/retry after:?\s*([a-z0-9.]+)/i)?.[1];
+    return retry ? `Glean Slack rate limit; retry after ${retry}.` : "Glean Slack rate limit.";
+  }
+
+  return text.length > 260 ? `${text.slice(0, 257)}...` : text;
 }
 
 async function readErrorBody(res: Response) {
