@@ -62,6 +62,7 @@ function storyFromItem(group: DigestGroup, item: DigestItem): BriefingStory {
     slackUrls: item.url ? [item.url] : [],
     score,
     sourceItemIds: [item.id],
+    timestamp: item.latestActivityTimestamp || item.timestamp || item.originalTimestamp,
   };
 }
 

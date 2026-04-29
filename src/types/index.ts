@@ -137,6 +137,7 @@ export interface BriefingStory {
   slackUrls: string[];
   score: number;
   sourceItemIds: string[];
+  timestamp?: string;
 }
 
 export interface BriefingData {

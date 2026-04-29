@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { BriefingData, BriefingStory, DigestData, TimeWindow } from "@/types";
 import { buildBriefing } from "@/lib/briefing";
 import { fetchDigest } from "@/lib/clientDigest";
-import { ArrowLeft, Clock, ExternalLink, RefreshCw } from "lucide-react";
+import { Archive, ArrowLeft, Clock, ExternalLink, RefreshCw, RotateCcw } from "lucide-react";
 
 const TIME_LABELS: Record<TimeWindow, string> = {
   "24h": "24 hours",
@@ -13,13 +13,25 @@ const TIME_LABELS: Record<TimeWindow, string> = {
   "7d": "7 days",
 };
 
+const READ_STORIES_KEY = "slack_digest_briefing_read_stories";
+
 export default function BriefingPage() {
   const router = useRouter();
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [timeWindow, setTimeWindow] = useState<TimeWindow>("24h");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const briefing = useMemo(() => (digest ? buildBriefing(digest) : null), [digest]);
+  const [readStoryIds, setReadStoryIds] = useState<Set<string>>(new Set());
+  const briefing = useMemo(() => (digest ? filterReadStories(buildBriefing(digest), readStoryIds) : null), [digest, readStoryIds]);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(READ_STORIES_KEY) ?? "[]");
+      setReadStoryIds(new Set(Array.isArray(saved) ? saved : []));
+    } catch {
+      setReadStoryIds(new Set());
+    }
+  }, []);
 
   const generate = useCallback(
     async (tw: TimeWindow) => {
@@ -44,6 +56,18 @@ export default function BriefingPage() {
   function changeWindow(next: TimeWindow) {
     setTimeWindow(next);
     generate(next);
+  }
+
+  function markRead(story: BriefingStory) {
+    const next = new Set(readStoryIds);
+    next.add(story.id);
+    setReadStoryIds(next);
+    localStorage.setItem(READ_STORIES_KEY, JSON.stringify(Array.from(next)));
+  }
+
+  function restoreRead() {
+    setReadStoryIds(new Set());
+    localStorage.removeItem(READ_STORIES_KEY);
   }
 
   return (
@@ -74,6 +98,14 @@ export default function BriefingPage() {
               ))}
             </div>
             <button
+              onClick={restoreRead}
+              disabled={readStoryIds.size === 0}
+              className="inline-flex items-center gap-2 rounded-full border border-stone-300 bg-white/60 px-3 py-2 text-sm font-semibold text-stone-600 hover:bg-white disabled:opacity-40"
+            >
+              <RotateCcw className="h-4 w-4" />
+              Restore read
+            </button>
+            <button
               onClick={() => generate(timeWindow)}
               disabled={loading}
               className="inline-flex items-center gap-2 rounded-full bg-stone-950 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-700 disabled:opacity-50"
@@ -96,7 +128,13 @@ export default function BriefingPage() {
             <span>•</span>
             <span>{briefing ? new Date(briefing.generatedAt).toLocaleString() : "Generating"}</span>
             <span>•</span>
-            <span>{briefing?.totalStories ?? 0} stories considered</span>
+            <span>{briefing?.totalStories ?? 0} unread stories</span>
+            {readStoryIds.size > 0 && (
+              <>
+                <span>•</span>
+                <span>{readStoryIds.size} read</span>
+              </>
+            )}
           </div>
         </div>
 
@@ -117,36 +155,44 @@ export default function BriefingPage() {
         {!error && briefing && briefing.totalStories === 0 && (
           <div className="mt-20 flex flex-col items-center gap-2 text-stone-500">
             <Clock className="h-8 w-8" />
-            <p className="font-semibold">No stories found for this edition.</p>
+            <p className="font-semibold">{readStoryIds.size > 0 ? "All briefing stories are marked read." : "No stories found for this edition."}</p>
+            {readStoryIds.size > 0 && (
+              <button
+                onClick={restoreRead}
+                className="mt-3 rounded-full bg-stone-950 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-700"
+              >
+                Restore read stories
+              </button>
+            )}
           </div>
         )}
 
-        {briefing && briefing.totalStories > 0 && <Newspaper briefing={briefing} />}
+        {briefing && briefing.totalStories > 0 && <Newspaper briefing={briefing} onRead={markRead} />}
       </main>
     </div>
   );
 }
 
-function Newspaper({ briefing }: { briefing: BriefingData }) {
+function Newspaper({ briefing, onRead }: { briefing: BriefingData; onRead: (story: BriefingStory) => void }) {
   return (
     <div className="mt-8">
-      {briefing.leadStory && <LeadStory story={briefing.leadStory} />}
+      {briefing.leadStory && <LeadStory story={briefing.leadStory} onRead={onRead} />}
 
       {briefing.secondaryStories.length > 0 && (
         <section className="mt-8 grid gap-5 border-y border-stone-300 py-6 md:grid-cols-2 xl:grid-cols-4">
           {briefing.secondaryStories.map((story) => (
-            <SmallStory key={story.id} story={story} />
+            <SmallStory key={story.id} story={story} onRead={onRead} />
           ))}
         </section>
       )}
 
-      <section className="mt-8 columns-1 gap-8 md:columns-2 xl:columns-3">
+      <section className="mt-8 grid gap-8 md:grid-cols-2 xl:grid-cols-3">
         {briefing.sections.map((section) => (
-          <div key={section.id} className="mb-8 break-inside-avoid border-t-2 border-stone-900 pt-3">
+          <div key={section.id} className="min-w-0 border-t-2 border-stone-900 pt-3">
             <h2 className="mb-4 text-xs font-black uppercase tracking-[0.3em] text-stone-500">{section.title}</h2>
             <div className="space-y-6">
               {section.stories.map((story) => (
-                <ArticleStory key={story.id} story={story} />
+                <ArticleStory key={story.id} story={story} onRead={onRead} />
               ))}
             </div>
           </div>
@@ -156,52 +202,53 @@ function Newspaper({ briefing }: { briefing: BriefingData }) {
   );
 }
 
-function LeadStory({ story }: { story: BriefingStory }) {
+function LeadStory({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
   return (
-    <article className="grid gap-6 border-b-2 border-stone-900 pb-8 lg:grid-cols-[1.15fr_0.85fr]">
-      <div>
-        <p className="text-xs font-black uppercase tracking-[0.35em] text-amber-800">Lead Story · {story.section}</p>
-        <h2 className="mt-3 font-serif text-4xl font-black leading-[0.95] text-stone-950 md:text-6xl">{story.headline}</h2>
+    <article className="grid min-w-0 gap-6 border-b-2 border-stone-900 pb-8 lg:grid-cols-[1.05fr_0.95fr]">
+      <div className="min-w-0">
+        <StoryKicker story={story} label={`Lead Story · ${story.section}`} />
+        <h2 className="mt-3 max-w-full overflow-hidden break-words font-serif text-3xl font-black leading-tight text-stone-950 md:text-5xl">{story.headline}</h2>
         <p className="mt-4 max-w-3xl text-xl leading-8 text-stone-700">{story.dek}</p>
       </div>
-      <StorySidebar story={story} />
+      <StorySidebar story={story} onRead={onRead} />
     </article>
   );
 }
 
-function SmallStory({ story }: { story: BriefingStory }) {
+function SmallStory({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
   return (
-    <article className="border-l border-stone-300 pl-4">
-      <p className="text-[11px] font-black uppercase tracking-[0.25em] text-stone-500">{story.section}</p>
-      <h3 className="mt-2 font-serif text-2xl font-black leading-7">{story.headline}</h3>
+    <article className="min-w-0 border-l border-stone-300 pl-4">
+      <StoryKicker story={story} label={story.section} />
+      <h3 className="mt-2 overflow-hidden break-words font-serif text-2xl font-black leading-7">{story.headline}</h3>
       <p className="mt-2 text-sm leading-6 text-stone-600">{story.dek}</p>
-      <StoryLinks story={story} compact />
+      <StoryLinks story={story} compact onRead={onRead} />
     </article>
   );
 }
 
-function ArticleStory({ story }: { story: BriefingStory }) {
+function ArticleStory({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
   return (
-    <article>
-      <h3 className="font-serif text-2xl font-black leading-7">{story.headline}</h3>
+    <article className="min-w-0 overflow-hidden">
+      <StoryKicker story={story} label={story.section} />
+      <h3 className="mt-1 overflow-hidden break-words font-serif text-2xl font-black leading-7">{story.headline}</h3>
       <p className="mt-2 text-sm font-semibold leading-6 text-stone-600">{story.dek}</p>
-      <div className="mt-3 space-y-3 text-sm leading-7 text-stone-800">
+      <div className="mt-3 space-y-3 overflow-hidden break-words text-sm leading-7 text-stone-800">
         {story.body.map((paragraph, index) => (
           <p key={index}>{paragraph}</p>
         ))}
       </div>
-      <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs leading-5 text-amber-950">
+      <div className="mt-3 overflow-hidden break-words rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs leading-5 text-amber-950">
         <span className="font-black uppercase tracking-wide text-amber-800">Why it matters: </span>
         {story.whyItMatters}
       </div>
-      <StoryLinks story={story} />
+      <StoryLinks story={story} onRead={onRead} />
     </article>
   );
 }
 
-function StorySidebar({ story }: { story: BriefingStory }) {
+function StorySidebar({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
   return (
-    <aside className="rounded-3xl border border-stone-300 bg-white/55 p-5 shadow-sm">
+    <aside className="min-w-0 overflow-hidden rounded-3xl border border-stone-300 bg-white/55 p-5 shadow-sm">
       <p className="text-xs font-black uppercase tracking-[0.25em] text-stone-500">Article Notes</p>
       <div className="mt-4 space-y-4 text-sm leading-6 text-stone-700">
         <p>
@@ -218,14 +265,21 @@ function StorySidebar({ story }: { story: BriefingStory }) {
           </p>
         )}
       </div>
-      <StoryLinks story={story} />
+      <StoryLinks story={story} onRead={onRead} />
     </aside>
   );
 }
 
-function StoryLinks({ story, compact = false }: { story: BriefingStory; compact?: boolean }) {
+function StoryLinks({ story, compact = false, onRead }: { story: BriefingStory; compact?: boolean; onRead: (story: BriefingStory) => void }) {
   return (
     <div className={`mt-4 flex flex-wrap gap-2 ${compact ? "text-xs" : "text-sm"}`}>
+      <button
+        onClick={() => onRead(story)}
+        className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-semibold text-emerald-800 hover:bg-emerald-100"
+      >
+        <Archive className="h-3.5 w-3.5" />
+        Read
+      </button>
       {story.channels.map((channel) =>
         channel.url ? (
           <a
@@ -256,4 +310,52 @@ function StoryLinks({ story, compact = false }: { story: BriefingStory; compact?
       )}
     </div>
   );
+}
+
+function StoryKicker({ story, label }: { story: BriefingStory; label: string }) {
+  return (
+    <p className="text-[11px] font-black uppercase tracking-[0.25em] text-stone-500">
+      {label}
+      {story.timestamp ? <span className="ml-2 tracking-normal text-stone-400">· {formatStoryTime(story.timestamp)}</span> : null}
+    </p>
+  );
+}
+
+function filterReadStories(briefing: BriefingData, readStoryIds: Set<string>): BriefingData {
+  const keep = (story?: BriefingStory) => story && !readStoryIds.has(story.id);
+  const leadStory = keep(briefing.leadStory) ? briefing.leadStory : undefined;
+  const secondaryStories = briefing.secondaryStories.filter((story) => !readStoryIds.has(story.id));
+  const sections = briefing.sections
+    .map((section) => ({
+      ...section,
+      stories: section.stories.filter((story) => !readStoryIds.has(story.id)),
+    }))
+    .filter((section) => section.stories.length > 0);
+
+  return {
+    ...briefing,
+    leadStory,
+    secondaryStories,
+    sections,
+    totalStories:
+      (leadStory ? 1 : 0) +
+      secondaryStories.length +
+      sections.reduce((sum, section) => sum + section.stories.length, 0),
+  };
+}
+
+function formatStoryTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime()) || date.getUTCFullYear() <= 1971) {
+    return "";
+  }
+
+  const diffMs = Date.now() - date.getTime();
+  const diffDays = Math.floor(diffMs / 86_400_000);
+
+  if (diffDays <= 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  if (diffDays < 7) return `${diffDays}d ago`;
+
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
