@@ -40,6 +40,7 @@ export function buildBriefing(digest: DigestData): BriefingData {
     secondaryStories,
     sections,
     totalStories: stories.length,
+    progressMessage: digest.progressMessage,
   };
 }
 

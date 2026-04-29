@@ -26,7 +26,12 @@ export default function DigestPage() {
       setError("");
 
       try {
-        setDigest(await fetchDigest({ timeWindow: tw, router, force }));
+        setDigest(await fetchDigest({
+          timeWindow: tw,
+          router,
+          force,
+          onProgress: (nextDigest) => setDigest(nextDigest),
+        }));
       } catch (error) {
         setError(error instanceof Error ? error.message : "Network error. Is the dev server running, and can it reach Glean?");
       } finally {
@@ -119,6 +124,12 @@ export default function DigestPage() {
             <p className="text-sm text-stone-400">
               Fetching Slack content for {TIME_WINDOW_LABELS[timeWindow]}…
             </p>
+          </div>
+        )}
+
+        {loading && digest && (
+          <div className="pointer-events-none fixed bottom-5 left-1/2 z-20 -translate-x-1/2 rounded-full border border-stone-200 bg-white/95 px-4 py-2 text-xs font-semibold text-stone-600 shadow-lg backdrop-blur">
+            {digest.progressMessage ?? "Improving summaries in the background..."}
           </div>
         )}
 

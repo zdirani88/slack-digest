@@ -2,7 +2,7 @@
 
 import { DigestItem } from "@/types";
 import { Archive, Clock, Hash, MessageSquare, Repeat2, ThumbsDown, ThumbsUp, User } from "lucide-react";
-import { formatDistanceToNow, parseISO } from "date-fns";
+import { parseISO } from "date-fns";
 import { ReactNode } from "react";
 
 interface Props {
@@ -22,7 +22,9 @@ function tryFormatTime(ts?: string): string {
       return "";
     }
 
-    return formatDistanceToNow(date, { addSuffix: true });
+    const day = date.toLocaleDateString(undefined, { weekday: "short" });
+    const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }).replace(":00", "");
+    return `${day} ${time}`;
   } catch {
     return "";
   }

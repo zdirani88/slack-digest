@@ -170,6 +170,10 @@ export default function DigestView({ digest }: Props) {
       channel: item.channel,
       author: item.author,
     });
+
+    if (value === "down") {
+      dismissItem(item);
+    }
   }
 
   function addInterest() {
@@ -615,7 +619,9 @@ function formatDisplayTime(value: string) {
     return "";
   }
 
-  return formatDistanceToNow(date, { addSuffix: true });
+  const day = date.toLocaleDateString(undefined, { weekday: "short" });
+  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }).replace(":00", "");
+  return `${day} ${time}`;
 }
 
 function rankItems(items: DigestItem[], sortMode: SortMode, interests: string[], feedback: FeedbackMap) {

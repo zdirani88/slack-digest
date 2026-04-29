@@ -5,10 +5,12 @@ export async function fetchDigest({
   timeWindow,
   router,
   force = false,
+  onProgress,
 }: {
   timeWindow: TimeWindow;
   router: AppRouterInstance;
   force?: boolean;
+  onProgress?: (digest: DigestData) => void;
 }): Promise<DigestData> {
   const token = localStorage.getItem("glean_token");
   const backendUrl = localStorage.getItem("glean_backend_url");
@@ -35,7 +37,7 @@ export async function fetchDigest({
     if (inflight) return inflight;
   }
 
-  const request = requestDigest({ timeWindow, token, backendUrl, preferences }).then((digest) => {
+  const request = requestDigest({ timeWindow, token, backendUrl, preferences, onProgress }).then((digest) => {
     setMemoryCache(cacheKey, digest);
     setStorageCache(cacheKey, digest);
     return digest;
@@ -59,13 +61,15 @@ async function requestDigest({
   token,
   backendUrl,
   preferences,
+  onProgress,
 }: {
   timeWindow: TimeWindow;
   token: string;
   backendUrl: string;
   preferences: DigestPreferences;
+  onProgress?: (digest: DigestData) => void;
 }) {
-  const res = await fetch("/api/digest/generate", {
+  const res = await fetch("/api/digest/stream", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -74,13 +78,74 @@ async function requestDigest({
     },
     body: JSON.stringify({ timeWindow, preferences }),
   });
-  const data = await res.json();
 
   if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
     throw new Error(formatErrorMessage(data.error));
   }
 
-  return data;
+  if (!res.body) {
+    const data = await res.json();
+    return data as DigestData;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let latestDigest: DigestData | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const event = parseStreamEvent(line);
+      if (!event) continue;
+
+      if (event.type === "error") {
+        throw new Error(formatErrorMessage(event.error));
+      }
+
+      if ((event.type === "digest" || event.type === "complete") && event.digest) {
+        latestDigest = event.digest;
+        onProgress?.(latestDigest);
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    const event = parseStreamEvent(buffer);
+    if (event?.type === "error") {
+      throw new Error(formatErrorMessage(event.error));
+    }
+    if ((event?.type === "digest" || event?.type === "complete") && event.digest) {
+      latestDigest = event.digest;
+      onProgress?.(latestDigest);
+    }
+  }
+
+  if (!latestDigest) {
+    throw new Error("Digest stream ended before any digest data was returned.");
+  }
+
+  return latestDigest;
+}
+
+function parseStreamEvent(line: string): null | {
+  type?: string;
+  digest?: DigestData;
+  error?: string;
+} {
+  try {
+    const value = JSON.parse(line);
+    return value && typeof value === "object" ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function makeDigestCacheKey(timeWindow: TimeWindow, backendUrl: string, preferences: DigestPreferences) {

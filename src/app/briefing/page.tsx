@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { BriefingData, BriefingStory, DigestData, TimeWindow } from "@/types";
 import { buildBriefing } from "@/lib/briefing";
 import { fetchDigest } from "@/lib/clientDigest";
-import { Archive, ArrowLeft, Clock, ExternalLink, RefreshCw, RotateCcw } from "lucide-react";
+import { Archive, ArrowLeft, Clock, ExternalLink, RefreshCw, RotateCcw, ThumbsDown } from "lucide-react";
 
 const TIME_LABELS: Record<TimeWindow, string> = {
   "24h": "24 hours",
@@ -14,6 +14,8 @@ const TIME_LABELS: Record<TimeWindow, string> = {
 };
 
 const READ_STORIES_KEY = "slack_digest_briefing_read_stories";
+const FEEDBACK_STORAGE_KEY = "slack_digest_item_feedback";
+const FEEDBACK_PROFILE_STORAGE_KEY = "slack_digest_feedback_profile";
 
 export default function BriefingPage() {
   const router = useRouter();
@@ -39,7 +41,12 @@ export default function BriefingPage() {
       setError("");
 
       try {
-        setDigest(await fetchDigest({ timeWindow: tw, router, force }));
+        setDigest(await fetchDigest({
+          timeWindow: tw,
+          router,
+          force,
+          onProgress: (nextDigest) => setDigest(nextDigest),
+        }));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unable to generate briefing.");
       } finally {
@@ -63,6 +70,11 @@ export default function BriefingPage() {
     next.add(story.id);
     setReadStoryIds(next);
     localStorage.setItem(READ_STORIES_KEY, JSON.stringify(Array.from(next)));
+  }
+
+  function downvoteStory(story: BriefingStory) {
+    writeStoryFeedback(story, "down");
+    markRead(story);
   }
 
   function restoreRead() {
@@ -126,7 +138,7 @@ export default function BriefingPage() {
           <div className="mt-3 flex flex-wrap items-center justify-center gap-3 text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">
             <span>{TIME_LABELS[timeWindow]}</span>
             <span>•</span>
-            <span>{briefing ? new Date(briefing.generatedAt).toLocaleString() : "Generating"}</span>
+            <span>{briefing ? formatEditionTime(briefing.generatedAt) : "Generating"}</span>
             <span>•</span>
             <span>{briefing?.totalStories ?? 0} unread stories</span>
             {readStoryIds.size > 0 && (
@@ -167,21 +179,47 @@ export default function BriefingPage() {
           </div>
         )}
 
-        {briefing && briefing.totalStories > 0 && <Newspaper briefing={briefing} onRead={markRead} />}
+        {loading && briefing && (
+          <div className="pointer-events-none fixed bottom-5 left-1/2 z-20 -translate-x-1/2 rounded-full border border-stone-300 bg-white/95 px-4 py-2 text-xs font-bold text-stone-600 shadow-lg">
+            {briefing.progressMessage ?? "Updating the edition as richer summaries arrive..."}
+          </div>
+        )}
+
+        {briefing && briefing.totalStories > 0 && (
+          <Newspaper briefing={briefing} onRead={markRead} onDownvote={downvoteStory} />
+        )}
       </main>
     </div>
   );
 }
 
-function Newspaper({ briefing, onRead }: { briefing: BriefingData; onRead: (story: BriefingStory) => void }) {
+function Newspaper({
+  briefing,
+  onRead,
+  onDownvote,
+}: {
+  briefing: BriefingData;
+  onRead: (story: BriefingStory) => void;
+  onDownvote: (story: BriefingStory) => void;
+}) {
+  const heroSecondary = briefing.secondaryStories[0];
+  const secondaryStories = briefing.secondaryStories.slice(1);
+
   return (
     <div className="mt-8">
-      {briefing.leadStory && <LeadStory story={briefing.leadStory} onRead={onRead} />}
+      {briefing.leadStory && (
+        <LeadStory
+          story={briefing.leadStory}
+          secondaryStory={heroSecondary}
+          onRead={onRead}
+          onDownvote={onDownvote}
+        />
+      )}
 
-      {briefing.secondaryStories.length > 0 && (
-        <section className="mt-8 grid gap-5 border-y border-stone-300 py-6 md:grid-cols-2 xl:grid-cols-4">
-          {briefing.secondaryStories.map((story) => (
-            <SmallStory key={story.id} story={story} onRead={onRead} />
+      {secondaryStories.length > 0 && (
+        <section className="mt-8 grid gap-5 border-y border-stone-300 py-6 md:grid-cols-2 xl:grid-cols-3">
+          {secondaryStories.map((story) => (
+            <SmallStory key={story.id} story={story} onRead={onRead} onDownvote={onDownvote} />
           ))}
         </section>
       )}
@@ -192,7 +230,7 @@ function Newspaper({ briefing, onRead }: { briefing: BriefingData; onRead: (stor
             <h2 className="mb-4 text-xs font-black uppercase tracking-[0.3em] text-stone-500">{section.title}</h2>
             <div className="space-y-6">
               {section.stories.map((story) => (
-                <ArticleStory key={story.id} story={story} onRead={onRead} />
+                <ArticleStory key={story.id} story={story} onRead={onRead} onDownvote={onDownvote} />
               ))}
             </div>
           </div>
@@ -202,31 +240,77 @@ function Newspaper({ briefing, onRead }: { briefing: BriefingData; onRead: (stor
   );
 }
 
-function LeadStory({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
+function LeadStory({
+  story,
+  secondaryStory,
+  onRead,
+  onDownvote,
+}: {
+  story: BriefingStory;
+  secondaryStory?: BriefingStory;
+  onRead: (story: BriefingStory) => void;
+  onDownvote: (story: BriefingStory) => void;
+}) {
   return (
-    <article className="grid min-w-0 gap-6 border-b-2 border-stone-900 pb-8 lg:grid-cols-[1.05fr_0.95fr]">
-      <div className="min-w-0">
+    <section className="grid min-w-0 gap-6 border-b-2 border-stone-900 pb-8 lg:grid-cols-[1.1fr_0.9fr]">
+      <article className="flex min-w-0 flex-col">
         <StoryKicker story={story} label={`Lead Story · ${story.section}`} />
-        <h2 className="mt-3 max-w-full overflow-hidden break-words font-serif text-3xl font-black leading-tight text-stone-950 md:text-5xl">{story.headline}</h2>
-        <p className="mt-4 max-w-3xl text-xl leading-8 text-stone-700">{story.dek}</p>
-      </div>
-      <StorySidebar story={story} onRead={onRead} />
-    </article>
+        <h2 className="mt-3 max-w-full overflow-hidden break-words font-serif text-3xl font-black leading-[0.98] text-stone-950 md:text-4xl xl:text-5xl">{story.headline}</h2>
+        <p className="mt-4 max-w-3xl text-lg leading-8 text-stone-700">{story.dek}</p>
+        <div className="mt-5 space-y-3 overflow-hidden break-words text-base leading-8 text-stone-800">
+          {story.body.slice(0, 2).map((paragraph, index) => (
+            <p key={index}>{paragraph}</p>
+          ))}
+        </div>
+        <StoryLinks story={story} onRead={onRead} onDownvote={onDownvote} />
+      </article>
+
+      {secondaryStory ? (
+        <article className="flex min-w-0 flex-col rounded-3xl border border-stone-300 bg-white/55 p-5 shadow-sm">
+          <StoryKicker story={secondaryStory} label={`Also Important · ${secondaryStory.section}`} />
+          <h3 className="mt-3 overflow-hidden break-words font-serif text-3xl font-black leading-tight text-stone-950">{secondaryStory.headline}</h3>
+          <p className="mt-3 text-base leading-7 text-stone-700">{secondaryStory.dek}</p>
+          <div className="mt-4 overflow-hidden break-words rounded-2xl border border-amber-200 bg-amber-50/80 p-4 text-sm leading-6 text-amber-950">
+            <span className="font-black uppercase tracking-wide text-amber-800">Why it matters: </span>
+            {secondaryStory.whyItMatters}
+          </div>
+          <div className="mt-auto">
+            <StoryLinks story={secondaryStory} onRead={onRead} onDownvote={onDownvote} />
+          </div>
+        </article>
+      ) : null}
+    </section>
   );
 }
 
-function SmallStory({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
+function SmallStory({
+  story,
+  onRead,
+  onDownvote,
+}: {
+  story: BriefingStory;
+  onRead: (story: BriefingStory) => void;
+  onDownvote: (story: BriefingStory) => void;
+}) {
   return (
     <article className="min-w-0 border-l border-stone-300 pl-4">
       <StoryKicker story={story} label={story.section} />
       <h3 className="mt-2 overflow-hidden break-words font-serif text-2xl font-black leading-7">{story.headline}</h3>
       <p className="mt-2 text-sm leading-6 text-stone-600">{story.dek}</p>
-      <StoryLinks story={story} compact onRead={onRead} />
+      <StoryLinks story={story} compact onRead={onRead} onDownvote={onDownvote} />
     </article>
   );
 }
 
-function ArticleStory({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
+function ArticleStory({
+  story,
+  onRead,
+  onDownvote,
+}: {
+  story: BriefingStory;
+  onRead: (story: BriefingStory) => void;
+  onDownvote: (story: BriefingStory) => void;
+}) {
   return (
     <article className="min-w-0 overflow-hidden">
       <StoryKicker story={story} label={story.section} />
@@ -241,44 +325,37 @@ function ArticleStory({ story, onRead }: { story: BriefingStory; onRead: (story:
         <span className="font-black uppercase tracking-wide text-amber-800">Why it matters: </span>
         {story.whyItMatters}
       </div>
-      <StoryLinks story={story} onRead={onRead} />
+      <StoryLinks story={story} onRead={onRead} onDownvote={onDownvote} />
     </article>
   );
 }
 
-function StorySidebar({ story, onRead }: { story: BriefingStory; onRead: (story: BriefingStory) => void }) {
+function StoryLinks({
+  story,
+  compact = false,
+  onRead,
+  onDownvote,
+}: {
+  story: BriefingStory;
+  compact?: boolean;
+  onRead: (story: BriefingStory) => void;
+  onDownvote: (story: BriefingStory) => void;
+}) {
   return (
-    <aside className="min-w-0 overflow-hidden rounded-3xl border border-stone-300 bg-white/55 p-5 shadow-sm">
-      <p className="text-xs font-black uppercase tracking-[0.25em] text-stone-500">Article Notes</p>
-      <div className="mt-4 space-y-4 text-sm leading-6 text-stone-700">
-        <p>
-          <span className="font-bold text-stone-950">Why it matters:</span> {story.whyItMatters}
-        </p>
-        {story.nextStep && (
-          <p>
-            <span className="font-bold text-stone-950">Next step:</span> {story.nextStep}
-          </p>
-        )}
-        {story.people.length > 0 && (
-          <p>
-            <span className="font-bold text-stone-950">People:</span> {story.people.join(", ")}
-          </p>
-        )}
-      </div>
-      <StoryLinks story={story} onRead={onRead} />
-    </aside>
-  );
-}
-
-function StoryLinks({ story, compact = false, onRead }: { story: BriefingStory; compact?: boolean; onRead: (story: BriefingStory) => void }) {
-  return (
-    <div className={`mt-4 flex flex-wrap gap-2 ${compact ? "text-xs" : "text-sm"}`}>
+    <div className={`mt-5 flex flex-wrap items-center gap-2 ${compact ? "text-xs" : "text-sm"}`}>
       <button
         onClick={() => onRead(story)}
         className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-semibold text-emerald-800 hover:bg-emerald-100"
       >
         <Archive className="h-3.5 w-3.5" />
         Read
+      </button>
+      <button
+        onClick={() => onDownvote(story)}
+        className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 font-semibold text-rose-800 hover:bg-rose-100"
+      >
+        <ThumbsDown className="h-3.5 w-3.5" />
+        Not useful
       </button>
       {story.channels.map((channel) =>
         channel.url ? (
@@ -350,12 +427,51 @@ function formatStoryTime(value: string) {
     return "";
   }
 
-  const diffMs = Date.now() - date.getTime();
-  const diffDays = Math.floor(diffMs / 86_400_000);
+  const day = date.toLocaleDateString(undefined, { weekday: "short" });
+  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }).replace(":00", "");
+  return `${day} ${time}`;
+}
 
-  if (diffDays <= 0) return "Today";
-  if (diffDays === 1) return "Yesterday";
-  if (diffDays < 7) return `${diffDays}d ago`;
+function formatEditionTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Generating";
+  return date.toLocaleString(undefined, {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
 
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+function writeStoryFeedback(story: BriefingStory, value: "down") {
+  try {
+    const feedback = JSON.parse(localStorage.getItem(FEEDBACK_STORAGE_KEY) ?? "{}");
+    for (const id of story.sourceItemIds.length ? story.sourceItemIds : [story.id]) {
+      feedback[id] = value;
+    }
+    localStorage.setItem(FEEDBACK_STORAGE_KEY, JSON.stringify(feedback));
+  } catch {
+    // Feedback is a learning convenience only.
+  }
+
+  try {
+    const profile = JSON.parse(localStorage.getItem(FEEDBACK_PROFILE_STORAGE_KEY) ?? "{}");
+    const dislikedChannels = toUniqueStrings([
+      ...(Array.isArray(profile.dislikedChannels) ? profile.dislikedChannels : []),
+      ...story.channels.map((channel) => channel.name),
+    ]);
+    profile.dislikedChannels = dislikedChannels;
+    localStorage.setItem(FEEDBACK_PROFILE_STORAGE_KEY, JSON.stringify(profile));
+  } catch {
+    // Profile feedback is best effort.
+  }
+}
+
+function toUniqueStrings(values: string[]) {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
 }

@@ -122,6 +122,12 @@ export interface DigestData {
   generatedAt: string;
   timeWindow: TimeWindow;
   totalItems: number;
+  status?: "partial" | "complete";
+  progressMessage?: string;
+  debug?: {
+    slackResults?: number;
+    phase?: string;
+  };
 }
 
 export interface BriefingStory {
@@ -147,6 +153,7 @@ export interface BriefingData {
   secondaryStories: BriefingStory[];
   sections: Array<{ id: string; title: string; stories: BriefingStory[] }>;
   totalStories: number;
+  progressMessage?: string;
 }
 
 export interface GleanConfig {

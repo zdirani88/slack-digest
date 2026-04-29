@@ -19,6 +19,11 @@ export function getTimeRange(window: TimeWindow) {
 
 const GLEAN_TIMEOUT_MS = 25000;
 const OPTIONAL_GLEAN_TIMEOUT_MS = 5000;
+const SEARCH_TARGET_RESULTS = 190;
+const GRAPH_CONTEXT_LIMIT = 16;
+const AI_MESSAGE_LIMIT = 60;
+const AI_ENRICHMENT_LIMIT = 36;
+const PEOPLE_BOOST_CACHE = new Map<string, number>();
 
 type MessageCandidate = {
   id: string;
@@ -71,6 +76,10 @@ export async function searchSlack(
   let hitRateLimit = false;
 
   for (const { query, pages, broad } of queries) {
+    if (dedupeSlackResults(collected).length >= SEARCH_TARGET_RESULTS) {
+      break;
+    }
+
     if (hitRateLimit && broad) {
       continue;
     }
@@ -121,34 +130,19 @@ export async function searchSlack(
 }
 
 function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
-  const baseQueries: SearchQueryPlan[] = [
-    { query: "", pages: 1, broad: true },
+  const priorityQueries: SearchQueryPlan[] = [
     { query: "@zubin", pages: 1 },
-    { query: "thread", pages: 1, broad: true },
-    { query: "urgent", pages: 1 },
-    { query: "incident", pages: 1 },
-    { query: "regression", pages: 1 },
-    { query: "debug", pages: 1 },
-    { query: "architecture", pages: 1 },
-    { query: "technical design", pages: 1 },
-    { query: "implementation", pages: 1 },
-    { query: "infra", pages: 1 },
-    { query: "deployment", pages: 1 },
-    { query: "launch", pages: 1 },
-    { query: "idea", pages: 1 },
-    { query: "brainstorm", pages: 1 },
-    { query: "experiment", pages: 1 },
-    { query: "prototype", pages: 1 },
-    { query: "what if", pages: 1 },
-    { query: "deal", pages: 1 },
-    { query: "pipeline", pages: 1 },
-    { query: "prospect", pages: 1 },
-    { query: "customer call", pages: 1 },
-    { query: "partner", pages: 1 },
-    { query: "partnership", pages: 1 },
-    { query: "nvidia", pages: 1 },
-    { query: "joint", pages: 1 },
     { query: "arvind", pages: 1 },
+    { query: "urgent blocker decision", pages: 1 },
+  ];
+  const baseQueries: SearchQueryPlan[] = [
+    { query: "", pages: 3, broad: true },
+    { query: "thread", pages: 2, broad: true },
+    { query: "incident regression outage debug", pages: 1 },
+    { query: "architecture implementation infra deployment", pages: 1 },
+    { query: "idea brainstorm experiment prototype", pages: 1 },
+    { query: "deal pipeline customer prospect gtm", pages: 1 },
+    { query: "partner partnership nvidia joint", pages: 1 },
   ];
   const preferredQueries = [
     ...(preferences.interests ?? []),
@@ -158,7 +152,7 @@ function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
   ]
     .map((query) => query.trim())
     .filter((query) => query.length > 2)
-    .slice(0, 8)
+    .slice(0, 5)
     .map((query) => ({ query, pages: 1 }));
   const disliked = new Set(
     [
@@ -167,7 +161,7 @@ function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
       ...(preferences.dislikedAuthors ?? []),
     ].map((value) => value.toLowerCase())
   );
-  const merged = [...preferredQueries, ...baseQueries].filter(({ query }) => {
+  const merged = [...preferredQueries, ...priorityQueries, ...baseQueries].filter(({ query }) => {
     const normalized = query.toLowerCase();
     return !normalized || !disliked.has(normalized);
   });
@@ -193,36 +187,10 @@ export async function generateDigestViaGleanChat(
     "7d": "7 days",
   };
 
-  const messages: MessageCandidate[] = results.map((r, i) => {
-    const webUrl = r.url ?? "";
-    const appUrl = r.nativeAppUrl ?? "";
-    const messageUrl = webUrl || appUrl;
-    const originalTimestamp = normalizeTimestamp(r.document?.metadata?.createTime);
-    const latestActivityTimestamp = normalizeTimestamp(
-      r.document?.metadata?.updateTime,
-      r.document?.metadata?.createTime
-    );
-
-    return {
-      id: `item_${i}`,
-      title: r.title ?? "Untitled",
-      channel: r.document?.metadata?.container ?? "unknown",
-      channelUrl: r.document?.metadata?.containerUrl ?? deriveSlackChannelUrl(webUrl || appUrl),
-      channelId: r.document?.metadata?.containerId ?? "",
-      author: r.document?.metadata?.author?.name ?? "unknown",
-      timestamp: latestActivityTimestamp,
-      originalTimestamp,
-      latestActivityTimestamp,
-      url: messageUrl,
-      authorUrl: "",
-      content: extractSlackContent(r),
-      signals: inferSignals(r),
-      graphContext: emptyGraphContext(),
-    };
-  });
+  const messages = buildMessageCandidates(results);
 
   // Keep the AI prompt bounded even when retrieval gets much broader.
-  const initialCandidates = prioritizeMessages(messages).slice(0, 80);
+  const initialCandidates = prioritizeMessages(messages).slice(0, AI_MESSAGE_LIMIT);
   const graphContexts = await fetchGraphContexts(initialCandidates, token, backendUrl);
   const graphMessages = messages.map((message) => {
     const graphContext = graphContexts.get(message.id) ?? emptyGraphContext();
@@ -235,9 +203,9 @@ export async function generateDigestViaGleanChat(
       },
     };
   });
-  const aiMessages = prioritizeMessages(graphMessages).slice(0, 80);
+  const aiMessages = prioritizeMessages(graphMessages).slice(0, AI_MESSAGE_LIMIT);
   const itemEnrichments = await generateItemEnrichmentsViaGleanChat(
-    aiMessages,
+    aiMessages.slice(0, AI_ENRICHMENT_LIMIT),
     token,
     backendUrl
   ).catch(() => new Map<string, AiDigestEnrichment>());
@@ -366,7 +334,59 @@ ${JSON.stringify(aiMessages, null, 2)}`;
     generatedAt: new Date().toISOString(),
     timeWindow,
     totalItems,
+    status: "complete",
   };
+}
+
+export function generateFastDigestFromResults(
+  results: GleanSearchResult[],
+  timeWindow: TimeWindow
+): DigestData {
+  const messages = buildMessageCandidates(results);
+  const groups = enrichGroups(
+    ensureAllGroups(buildFallbackGroups(prioritizeMessages(messages).slice(0, AI_MESSAGE_LIMIT))),
+    messages
+  );
+  const totalItems = groups.reduce((sum, group) => sum + group.items.length, 0);
+
+  return {
+    groups,
+    generatedAt: new Date().toISOString(),
+    timeWindow,
+    totalItems,
+    status: "partial",
+    progressMessage: "Showing a fast local ranking while Glean writes better summaries.",
+  };
+}
+
+function buildMessageCandidates(results: GleanSearchResult[]): MessageCandidate[] {
+  return results.map((r, i) => {
+    const webUrl = r.url ?? "";
+    const appUrl = r.nativeAppUrl ?? "";
+    const messageUrl = webUrl || appUrl;
+    const originalTimestamp = normalizeTimestamp(r.document?.metadata?.createTime);
+    const latestActivityTimestamp = normalizeTimestamp(
+      r.document?.metadata?.updateTime,
+      r.document?.metadata?.createTime
+    );
+
+    return {
+      id: `item_${i}`,
+      title: r.title ?? "Untitled",
+      channel: r.document?.metadata?.container ?? "unknown",
+      channelUrl: r.document?.metadata?.containerUrl ?? deriveSlackChannelUrl(webUrl || appUrl),
+      channelId: r.document?.metadata?.containerId ?? "",
+      author: r.document?.metadata?.author?.name ?? "unknown",
+      timestamp: latestActivityTimestamp,
+      originalTimestamp,
+      latestActivityTimestamp,
+      url: messageUrl,
+      authorUrl: "",
+      content: extractSlackContent(r),
+      signals: inferSignals(r),
+      graphContext: emptyGraphContext(),
+    };
+  });
 }
 
 const GROUP_META: Array<{ id: string; title: string; emoji: string; priority: number }> = [
@@ -519,7 +539,7 @@ async function fetchGraphContexts(
   backendUrl: string
 ): Promise<Map<string, DigestGraphContext>> {
   const feed = await fetchPersonalFeed(token, backendUrl).catch(() => emptyGraphSeed());
-  const limited = messages.slice(0, 40);
+  const limited = messages.slice(0, GRAPH_CONTEXT_LIMIT);
   const entries = await Promise.all(
     limited.map(async (message) => {
       const [recommendations, peopleBoost] = await Promise.all([
@@ -570,6 +590,12 @@ async function fetchPeopleBoost(
     return 0;
   }
 
+  const cacheKey = message.author.toLowerCase();
+  const cached = PEOPLE_BOOST_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   const data = await fetchOptionalJson(`${backendUrl.replace(/\/$/, "")}/rest/api/v1/listentities`, token, {
     query: message.author,
     entityType: "PEOPLE",
@@ -587,6 +613,7 @@ async function fetchPeopleBoost(
     boost += 4;
   }
 
+  PEOPLE_BOOST_CACHE.set(cacheKey, boost);
   return boost;
 }
 
