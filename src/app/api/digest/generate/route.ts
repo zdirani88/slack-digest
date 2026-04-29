@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { searchSlack, generateDigestViaGleanChat } from "@/lib/glean";
-import { TimeWindow } from "@/types";
+import { DigestPreferences, TimeWindow } from "@/types";
 
 export async function POST(req: NextRequest) {
   const token = req.headers.get("x-glean-token");
@@ -11,17 +11,21 @@ export async function POST(req: NextRequest) {
   }
 
   let timeWindow: TimeWindow = "24h";
+  let preferences: DigestPreferences = {};
   try {
     const body = await req.json();
     if (["24h", "3d", "7d"].includes(body.timeWindow)) {
       timeWindow = body.timeWindow;
+    }
+    if (body.preferences && typeof body.preferences === "object") {
+      preferences = body.preferences;
     }
   } catch {
     // use default
   }
 
   try {
-    const results = await searchSlack(timeWindow, token, backendUrl);
+    const results = await searchSlack(timeWindow, token, backendUrl, preferences);
 
     if (results.length === 0) {
       return NextResponse.json({

@@ -1,7 +1,7 @@
 "use client";
 
 import { DigestItem } from "@/types";
-import { Archive, Clock, Hash, MessageSquare, Repeat2, ThumbsUp, User } from "lucide-react";
+import { Archive, Clock, Hash, MessageSquare, Repeat2, ThumbsDown, ThumbsUp, User } from "lucide-react";
 import { formatDistanceToNow, parseISO } from "date-fns";
 import { ReactNode } from "react";
 
@@ -10,6 +10,8 @@ interface Props {
   isSelected: boolean;
   onSelect: () => void;
   onDismiss: () => void;
+  feedback?: "up" | "down";
+  onFeedback: (value: "up" | "down") => void;
 }
 
 function tryFormatTime(ts?: string): string {
@@ -26,7 +28,7 @@ function tryFormatTime(ts?: string): string {
   }
 }
 
-export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Props) {
+export default function ThreadCard({ item, isSelected, onSelect, onDismiss, feedback, onFeedback }: Props) {
   const contentSummary = item.threadSummary || item.preview || item.rawExcerpt || item.fullText || "";
 
   return (
@@ -52,17 +54,31 @@ export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Pr
             <p className="line-clamp-1 text-sm font-semibold leading-5 text-slate-950">{item.summary || item.title}</p>
             <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-500">{contentSummary}</p>
           </div>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              onDismiss();
-            }}
-            title="Dismiss"
-            aria-label="Dismiss message"
-            className="rounded-md p-1.5 text-slate-400 hover:bg-emerald-50 hover:text-emerald-700"
-          >
-            <Archive className="h-4 w-4" />
-          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <FeedbackButton
+              active={feedback === "up"}
+              label="Useful"
+              onClick={() => onFeedback("up")}
+              icon={<ThumbsUp className="h-4 w-4" />}
+            />
+            <FeedbackButton
+              active={feedback === "down"}
+              label="Not useful"
+              onClick={() => onFeedback("down")}
+              icon={<ThumbsDown className="h-4 w-4" />}
+            />
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                onDismiss();
+              }}
+              title="Dismiss"
+              aria-label="Dismiss message"
+              className="rounded-md p-1.5 text-slate-400 hover:bg-emerald-50 hover:text-emerald-700"
+            >
+              <Archive className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         <div className="mt-3 flex flex-wrap gap-1.5">
@@ -87,6 +103,36 @@ export default function ThreadCard({ item, isSelected, onSelect, onDismiss }: Pr
         </div>
       </div>
     </article>
+  );
+}
+
+function FeedbackButton({
+  active,
+  label,
+  icon,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      title={label}
+      aria-label={label}
+      className={`rounded-md p-1.5 ${
+        active
+          ? "bg-blue-50 text-blue-700"
+          : "text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+      }`}
+    >
+      {icon}
+    </button>
   );
 }
 

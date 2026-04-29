@@ -13,6 +13,8 @@ import {
   Hash,
   Inbox,
   Layers3,
+  ThumbsDown,
+  ThumbsUp,
   Plus,
   RotateCcw,
   SlidersHorizontal,
@@ -26,16 +28,22 @@ interface Props {
 
 const DISMISSED_STORAGE_KEY = "slack_digest_dismissed_items";
 const INTERESTS_STORAGE_KEY = "slack_digest_interests";
+const FEEDBACK_STORAGE_KEY = "slack_digest_item_feedback";
+const FEEDBACK_PROFILE_STORAGE_KEY = "slack_digest_feedback_profile";
+const ALL_GROUP_ID = "all_updates";
 
 type SortMode = "priority" | "recency";
+type FeedbackValue = "up" | "down";
+type FeedbackMap = Record<string, FeedbackValue>;
 
 export default function DigestView({ digest }: Props) {
   const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
-  const [activeGroupId, setActiveGroupId] = useState("");
+  const [activeGroupId, setActiveGroupId] = useState(ALL_GROUP_ID);
   const [selectedItemKey, setSelectedItemKey] = useState<string | null>(null);
   const [sortMode, setSortMode] = useState<SortMode>("priority");
   const [interests, setInterests] = useState<string[]>([]);
   const [interestDraft, setInterestDraft] = useState("");
+  const [feedback, setFeedback] = useState<FeedbackMap>({});
 
   useEffect(() => {
     try {
@@ -43,6 +51,15 @@ export default function DigestView({ digest }: Props) {
       setDismissedKeys(new Set(Array.isArray(saved) ? saved : []));
     } catch {
       setDismissedKeys(new Set());
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(FEEDBACK_STORAGE_KEY) ?? "{}");
+      setFeedback(saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {});
+    } catch {
+      setFeedback({});
     }
   }, []);
 
@@ -64,16 +81,25 @@ export default function DigestView({ digest }: Props) {
       items: group.items.filter((item) => !dismissedKeys.has(getItemKey(item))),
     }));
   }, [digest.groups, dismissedKeys]);
+  const remainingItems = groups.reduce((sum, group) => sum + group.items.length, 0);
 
-  const visibleGroups = groups.filter((group) => group.items.length > 0);
-  const activeGroup = groups.find((group) => group.id === activeGroupId) ?? visibleGroups[0];
+  const allGroup = useMemo<DigestGroup>(() => ({
+    id: ALL_GROUP_ID,
+    title: "All Updates",
+    emoji: "🗞️",
+    priority: 0,
+    summary: `${remainingItems} open item${remainingItems === 1 ? "" : "s"} across all categories.`,
+    items: groups.flatMap((group) => group.items),
+  }), [groups, remainingItems]);
+  const navGroups = [allGroup, ...groups];
+  const visibleGroups = navGroups.filter((group) => group.items.length > 0);
+  const activeGroup = navGroups.find((group) => group.id === activeGroupId) ?? visibleGroups[0];
   const activeItems = useMemo(() => {
     const items = activeGroup?.items ?? [];
-    return rankItems(items, sortMode, interests);
-  }, [activeGroup, sortMode, interests]);
+    return rankItems(items, sortMode, interests, feedback);
+  }, [activeGroup, sortMode, interests, feedback]);
   const selectedItem =
     activeItems.find((item) => getItemKey(item) === selectedItemKey) ?? activeItems[0] ?? null;
-  const remainingItems = groups.reduce((sum, group) => sum + group.items.length, 0);
   const dismissedCount = dismissedKeys.size;
 
   useEffect(() => {
@@ -121,6 +147,29 @@ export default function DigestView({ digest }: Props) {
 
   function restoreDismissed() {
     persistDismissed(new Set());
+  }
+
+  function setItemFeedback(item: DigestItem, value: FeedbackValue) {
+    const key = getItemKey(item);
+    const next = { ...feedback };
+
+    if (next[key] === value) {
+      delete next[key];
+    } else {
+      next[key] = value;
+    }
+
+    setFeedback(next);
+    localStorage.setItem(FEEDBACK_STORAGE_KEY, JSON.stringify(next));
+    updateFeedbackProfile(item, next[key]);
+    logEvent("item_feedback", {
+      itemId: item.id,
+      key,
+      feedback: next[key] ?? "cleared",
+      topics: item.topics ?? [],
+      channel: item.channel,
+      author: item.author,
+    });
   }
 
   function addInterest() {
@@ -245,7 +294,7 @@ export default function DigestView({ digest }: Props) {
         </div>
 
         <nav className="flex gap-2 overflow-x-auto px-3 py-3 xl:block xl:space-y-1 xl:overflow-y-auto">
-          {groups.map((group) => (
+          {navGroups.map((group) => (
             <button
               key={group.id}
               onClick={() => {
@@ -306,6 +355,8 @@ export default function DigestView({ digest }: Props) {
                   isSelected={selectedItem ? getItemKey(selectedItem) === key : false}
                   onSelect={() => setSelectedItemKey(key)}
                   onDismiss={() => dismissItem(item)}
+                  feedback={feedback[key]}
+                  onFeedback={(value) => setItemFeedback(item, value)}
                 />
               );
             })}
@@ -315,7 +366,12 @@ export default function DigestView({ digest }: Props) {
 
       <section className="min-h-0 bg-slate-50">
         {selectedItem ? (
-          <MessagePreview item={selectedItem} onDismiss={() => dismissItem(selectedItem)} />
+          <MessagePreview
+            item={selectedItem}
+            onDismiss={() => dismissItem(selectedItem)}
+            feedback={feedback[getItemKey(selectedItem)]}
+            onFeedback={(value) => setItemFeedback(selectedItem, value)}
+          />
         ) : (
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-slate-500">
             Select a message
@@ -335,7 +391,17 @@ function Metric({ label, value }: { label: string; value: number }) {
   );
 }
 
-function MessagePreview({ item, onDismiss }: { item: DigestItem; onDismiss: () => void }) {
+function MessagePreview({
+  item,
+  onDismiss,
+  feedback,
+  onFeedback,
+}: {
+  item: DigestItem;
+  onDismiss: () => void;
+  feedback?: FeedbackValue;
+  onFeedback: (value: FeedbackValue) => void;
+}) {
   const [isExcerptExpanded, setIsExcerptExpanded] = useState(false);
   const excerpt = item.rawExcerpt || item.preview || "";
   const fullText = item.fullText || excerpt;
@@ -356,6 +422,28 @@ function MessagePreview({ item, onDismiss }: { item: DigestItem; onDismiss: () =
             <h2 className="mt-1 text-xl font-semibold leading-7 text-slate-950">{item.title}</h2>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            <button
+              onClick={() => onFeedback("up")}
+              className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium ${
+                feedback === "up"
+                  ? "border-blue-200 bg-blue-50 text-blue-700"
+                  : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+            >
+              <ThumbsUp className="h-4 w-4" />
+              Useful
+            </button>
+            <button
+              onClick={() => onFeedback("down")}
+              className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium ${
+                feedback === "down"
+                  ? "border-rose-200 bg-rose-50 text-rose-700"
+                  : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+            >
+              <ThumbsDown className="h-4 w-4" />
+              Not useful
+            </button>
             {item.url && (
               <a
                 href={item.url}
@@ -530,21 +618,41 @@ function formatDisplayTime(value: string) {
   return formatDistanceToNow(date, { addSuffix: true });
 }
 
-function rankItems(items: DigestItem[], sortMode: SortMode, interests: string[]) {
+function rankItems(items: DigestItem[], sortMode: SortMode, interests: string[], feedback: FeedbackMap) {
   return [...items].sort((a, b) => {
     if (sortMode === "recency") {
       return getTimeValue(b.latestActivityTimestamp ?? b.timestamp) - getTimeValue(a.latestActivityTimestamp ?? a.timestamp);
     }
 
-    return getPriorityScore(b, interests) - getPriorityScore(a, interests);
+    return getPriorityScore(b, interests, feedback) - getPriorityScore(a, interests, feedback);
   });
 }
 
-function getPriorityScore(item: DigestItem, interests: string[]) {
+function getPriorityScore(item: DigestItem, interests: string[], feedback: FeedbackMap) {
   const text = `${item.title} ${item.channel ?? ""} ${item.summary ?? ""} ${item.fullText ?? ""}`.toLowerCase();
   const interestBoost = interests.filter((interest) => text.includes(interest.toLowerCase())).length * 6;
+  const learnedBoost = getFeedbackBoost(item, feedback);
   const suppressionPenalty = item.isSuppressed ? 10 : 0;
-  return (item.rankingScore ?? 0) + interestBoost + (item.graphContext?.score ?? 0) - suppressionPenalty;
+  return (item.rankingScore ?? 0) + interestBoost + learnedBoost + (item.graphContext?.score ?? 0) - suppressionPenalty;
+}
+
+function getFeedbackBoost(item: DigestItem, feedback: FeedbackMap) {
+  let boost = feedback[getItemKey(item)] === "up" ? 16 : feedback[getItemKey(item)] === "down" ? -24 : 0;
+  const itemTopics = new Set((item.topics ?? []).map((topic) => topic.toLowerCase()));
+  const itemText = `${item.channel ?? ""} ${item.author ?? ""}`.toLowerCase();
+
+  for (const [key, value] of Object.entries(feedback)) {
+    if (key === getItemKey(item)) continue;
+    const polarity = value === "up" ? 1 : -1;
+    const keyText = key.toLowerCase();
+    const topicMatch = Array.from(itemTopics).some((topic) => keyText.includes(topic));
+    const channelOrAuthorMatch = itemText && keyText.includes(itemText);
+
+    if (topicMatch) boost += polarity * 3;
+    if (channelOrAuthorMatch) boost += polarity * 2;
+  }
+
+  return boost;
 }
 
 function getTimeValue(value?: string) {
@@ -567,6 +675,78 @@ function inferInterestsFromDigest(digest: DigestData) {
   return Array.from(counts.entries())
     .sort((a, b) => b[1] - a[1])
     .map(([topic]) => topic);
+}
+
+function updateFeedbackProfile(item: DigestItem, value?: FeedbackValue) {
+  const profile = readFeedbackProfile();
+  const topics = item.topics ?? [];
+  const channels = item.channel ? [item.channel] : [];
+  const authors = item.author ? [item.author] : [];
+
+  removeTerms(profile.likedTopics, topics);
+  removeTerms(profile.dislikedTopics, topics);
+  removeTerms(profile.likedChannels, channels);
+  removeTerms(profile.dislikedChannels, channels);
+  removeTerms(profile.likedAuthors, authors);
+  removeTerms(profile.dislikedAuthors, authors);
+
+  if (value === "up") {
+    addTerms(profile.likedTopics, topics);
+    addTerms(profile.likedChannels, channels);
+    addTerms(profile.likedAuthors, authors);
+  }
+
+  if (value === "down") {
+    addTerms(profile.dislikedTopics, topics);
+    addTerms(profile.dislikedChannels, channels);
+    addTerms(profile.dislikedAuthors, authors);
+  }
+
+  localStorage.setItem(FEEDBACK_PROFILE_STORAGE_KEY, JSON.stringify(profile));
+}
+
+function readFeedbackProfile() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FEEDBACK_PROFILE_STORAGE_KEY) ?? "{}");
+    return {
+      likedTopics: toStringArray(saved?.likedTopics),
+      dislikedTopics: toStringArray(saved?.dislikedTopics),
+      likedChannels: toStringArray(saved?.likedChannels),
+      dislikedChannels: toStringArray(saved?.dislikedChannels),
+      likedAuthors: toStringArray(saved?.likedAuthors),
+      dislikedAuthors: toStringArray(saved?.dislikedAuthors),
+    };
+  } catch {
+    return {
+      likedTopics: [],
+      dislikedTopics: [],
+      likedChannels: [],
+      dislikedChannels: [],
+      likedAuthors: [],
+      dislikedAuthors: [],
+    };
+  }
+}
+
+function addTerms(target: string[], terms: string[]) {
+  for (const term of terms.map((value) => value.trim()).filter(Boolean)) {
+    if (!target.some((entry) => entry.toLowerCase() === term.toLowerCase())) {
+      target.push(term);
+    }
+  }
+}
+
+function removeTerms(target: string[], terms: string[]) {
+  for (const term of terms) {
+    const index = target.findIndex((entry) => entry.toLowerCase() === term.toLowerCase());
+    if (index >= 0) {
+      target.splice(index, 1);
+    }
+  }
+}
+
+function toStringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
 function logEvent(name: string, payload: Record<string, unknown>) {

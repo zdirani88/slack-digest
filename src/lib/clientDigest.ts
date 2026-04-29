@@ -1,5 +1,5 @@
 import { AppRouterInstance } from "next/dist/shared/lib/app-router-context.shared-runtime";
-import { DigestData, TimeWindow } from "@/types";
+import { DigestData, DigestPreferences, TimeWindow } from "@/types";
 
 export async function fetchDigest({
   timeWindow,
@@ -23,7 +23,7 @@ export async function fetchDigest({
       "x-glean-token": token,
       "x-glean-backend": backendUrl,
     },
-    body: JSON.stringify({ timeWindow }),
+    body: JSON.stringify({ timeWindow, preferences: readDigestPreferences() }),
   });
   const data = await res.json();
 
@@ -32,6 +32,31 @@ export async function fetchDigest({
   }
 
   return data;
+}
+
+function readDigestPreferences(): DigestPreferences {
+  return {
+    interests: readStringArray("slack_digest_interests"),
+    ...readFeedbackProfile(),
+  };
+}
+
+function readStringArray(key: string) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? "[]");
+    return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function readFeedbackProfile() {
+  try {
+    const value = JSON.parse(localStorage.getItem("slack_digest_feedback_profile") ?? "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
 }
 
 export function formatErrorMessage(error: unknown) {

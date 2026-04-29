@@ -153,3 +153,13 @@ export interface GleanConfig {
   token: string;
   backendUrl: string;
 }
+
+export interface DigestPreferences {
+  interests?: string[];
+  likedTopics?: string[];
+  dislikedTopics?: string[];
+  likedChannels?: string[];
+  dislikedChannels?: string[];
+  likedAuthors?: string[];
+  dislikedAuthors?: string[];
+}

@@ -8,6 +8,7 @@ import {
   DigestSignals,
   DigestAction,
   DigestGraphContext,
+  DigestPreferences,
 } from "@/types";
 
 export function getTimeRange(window: TimeWindow) {
@@ -49,42 +50,21 @@ type GraphSeed = {
   titles: Set<string>;
 };
 
+type SearchQueryPlan = {
+  query: string;
+  pages: number;
+  broad?: boolean;
+};
+
 export async function searchSlack(
   timeWindow: TimeWindow,
   token: string,
-  backendUrl: string
+  backendUrl: string,
+  preferences: DigestPreferences = {}
 ): Promise<GleanSearchResult[]> {
   const url = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/search`;
   const timeRange = getTimeRange(timeWindow);
-  const queries = [
-    { query: "", pages: 1, broad: true },
-    { query: "@zubin", pages: 1 },
-    { query: "thread", pages: 1, broad: true },
-    { query: "urgent", pages: 1 },
-    { query: "incident", pages: 1 },
-    { query: "regression", pages: 1 },
-    { query: "debug", pages: 1 },
-    { query: "architecture", pages: 1 },
-    { query: "technical design", pages: 1 },
-    { query: "implementation", pages: 1 },
-    { query: "infra", pages: 1 },
-    { query: "deployment", pages: 1 },
-    { query: "launch", pages: 1 },
-    { query: "idea", pages: 1 },
-    { query: "brainstorm", pages: 1 },
-    { query: "experiment", pages: 1 },
-    { query: "prototype", pages: 1 },
-    { query: "what if", pages: 1 },
-    { query: "deal", pages: 1 },
-    { query: "pipeline", pages: 1 },
-    { query: "prospect", pages: 1 },
-    { query: "customer call", pages: 1 },
-    { query: "partner", pages: 1 },
-    { query: "partnership", pages: 1 },
-    { query: "nvidia", pages: 1 },
-    { query: "joint", pages: 1 },
-    { query: "arvind", pages: 1 },
-  ];
+  const queries = buildSearchQueries(preferences);
 
   const collected: GleanSearchResult[] = [];
   const errors: string[] = [];
@@ -127,7 +107,7 @@ export async function searchSlack(
     }
   }
 
-  const deduped = dedupeSlackResults(collected).slice(0, 180);
+  const deduped = dedupeSlackResults(collected).slice(0, 220);
 
   if (deduped.length === 0 && errors.length > 0) {
     if (hitRateLimit) {
@@ -138,6 +118,67 @@ export async function searchSlack(
   }
 
   return deduped;
+}
+
+function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
+  const baseQueries: SearchQueryPlan[] = [
+    { query: "", pages: 1, broad: true },
+    { query: "@zubin", pages: 1 },
+    { query: "thread", pages: 1, broad: true },
+    { query: "urgent", pages: 1 },
+    { query: "incident", pages: 1 },
+    { query: "regression", pages: 1 },
+    { query: "debug", pages: 1 },
+    { query: "architecture", pages: 1 },
+    { query: "technical design", pages: 1 },
+    { query: "implementation", pages: 1 },
+    { query: "infra", pages: 1 },
+    { query: "deployment", pages: 1 },
+    { query: "launch", pages: 1 },
+    { query: "idea", pages: 1 },
+    { query: "brainstorm", pages: 1 },
+    { query: "experiment", pages: 1 },
+    { query: "prototype", pages: 1 },
+    { query: "what if", pages: 1 },
+    { query: "deal", pages: 1 },
+    { query: "pipeline", pages: 1 },
+    { query: "prospect", pages: 1 },
+    { query: "customer call", pages: 1 },
+    { query: "partner", pages: 1 },
+    { query: "partnership", pages: 1 },
+    { query: "nvidia", pages: 1 },
+    { query: "joint", pages: 1 },
+    { query: "arvind", pages: 1 },
+  ];
+  const preferredQueries = [
+    ...(preferences.interests ?? []),
+    ...(preferences.likedTopics ?? []),
+    ...(preferences.likedChannels ?? []).map((channel) => channel.replace(/^#/, "")),
+    ...(preferences.likedAuthors ?? []),
+  ]
+    .map((query) => query.trim())
+    .filter((query) => query.length > 2)
+    .slice(0, 8)
+    .map((query) => ({ query, pages: 1 }));
+  const disliked = new Set(
+    [
+      ...(preferences.dislikedTopics ?? []),
+      ...(preferences.dislikedChannels ?? []).map((channel) => channel.replace(/^#/, "")),
+      ...(preferences.dislikedAuthors ?? []),
+    ].map((value) => value.toLowerCase())
+  );
+  const merged = [...preferredQueries, ...baseQueries].filter(({ query }) => {
+    const normalized = query.toLowerCase();
+    return !normalized || !disliked.has(normalized);
+  });
+  const seen = new Set<string>();
+
+  return merged.filter(({ query }) => {
+    const key = query.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export async function generateDigestViaGleanChat(
