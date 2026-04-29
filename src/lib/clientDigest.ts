@@ -4,9 +4,11 @@ import { DigestData, DigestPreferences, TimeWindow } from "@/types";
 export async function fetchDigest({
   timeWindow,
   router,
+  force = false,
 }: {
   timeWindow: TimeWindow;
   router: AppRouterInstance;
+  force?: boolean;
 }): Promise<DigestData> {
   const token = localStorage.getItem("glean_token");
   const backendUrl = localStorage.getItem("glean_backend_url");
@@ -16,6 +18,53 @@ export async function fetchDigest({
     throw new Error("Missing Glean setup.");
   }
 
+  const preferences = readDigestPreferences();
+  const cacheKey = makeDigestCacheKey(timeWindow, backendUrl, preferences);
+
+  if (!force) {
+    const memoryHit = getMemoryCache(cacheKey);
+    if (memoryHit) return memoryHit;
+
+    const storageHit = getStorageCache(cacheKey);
+    if (storageHit) {
+      setMemoryCache(cacheKey, storageHit);
+      return storageHit;
+    }
+
+    const inflight = getInflight(cacheKey);
+    if (inflight) return inflight;
+  }
+
+  const request = requestDigest({ timeWindow, token, backendUrl, preferences }).then((digest) => {
+    setMemoryCache(cacheKey, digest);
+    setStorageCache(cacheKey, digest);
+    return digest;
+  });
+
+  setInflight(cacheKey, request);
+
+  try {
+    return await request;
+  } finally {
+    clearInflight(cacheKey);
+  }
+}
+
+const DIGEST_CACHE_TTL_MS = 5 * 60 * 1000;
+const MEMORY_CACHE = new Map<string, { digest: DigestData; cachedAt: number }>();
+const INFLIGHT = new Map<string, Promise<DigestData>>();
+
+async function requestDigest({
+  timeWindow,
+  token,
+  backendUrl,
+  preferences,
+}: {
+  timeWindow: TimeWindow;
+  token: string;
+  backendUrl: string;
+  preferences: DigestPreferences;
+}) {
   const res = await fetch("/api/digest/generate", {
     method: "POST",
     headers: {
@@ -23,7 +72,7 @@ export async function fetchDigest({
       "x-glean-token": token,
       "x-glean-backend": backendUrl,
     },
-    body: JSON.stringify({ timeWindow, preferences: readDigestPreferences() }),
+    body: JSON.stringify({ timeWindow, preferences }),
   });
   const data = await res.json();
 
@@ -32,6 +81,61 @@ export async function fetchDigest({
   }
 
   return data;
+}
+
+function makeDigestCacheKey(timeWindow: TimeWindow, backendUrl: string, preferences: DigestPreferences) {
+  return `digest:${timeWindow}:${backendUrl}:${stableStringify(preferences)}`;
+}
+
+function getMemoryCache(key: string) {
+  const entry = MEMORY_CACHE.get(key);
+  if (!entry || Date.now() - entry.cachedAt > DIGEST_CACHE_TTL_MS) {
+    MEMORY_CACHE.delete(key);
+    return null;
+  }
+
+  return entry.digest;
+}
+
+function setMemoryCache(key: string, digest: DigestData) {
+  MEMORY_CACHE.set(key, { digest, cachedAt: Date.now() });
+}
+
+function getStorageCache(key: string) {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+
+    const entry = JSON.parse(raw);
+    if (!entry?.digest || typeof entry.cachedAt !== "number" || Date.now() - entry.cachedAt > DIGEST_CACHE_TTL_MS) {
+      sessionStorage.removeItem(key);
+      return null;
+    }
+
+    return entry.digest as DigestData;
+  } catch {
+    return null;
+  }
+}
+
+function setStorageCache(key: string, digest: DigestData) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ digest, cachedAt: Date.now() }));
+  } catch {
+    // Cache storage is a convenience only.
+  }
+}
+
+function getInflight(key: string) {
+  return INFLIGHT.get(key);
+}
+
+function setInflight(key: string, request: Promise<DigestData>) {
+  INFLIGHT.set(key, request);
+}
+
+function clearInflight(key: string) {
+  INFLIGHT.delete(key);
 }
 
 function readDigestPreferences(): DigestPreferences {
@@ -57,6 +161,21 @@ function readFeedbackProfile() {
   } catch {
     return {};
   }
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
 }
 
 export function formatErrorMessage(error: unknown) {

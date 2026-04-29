@@ -34,12 +34,12 @@ export default function BriefingPage() {
   }, []);
 
   const generate = useCallback(
-    async (tw: TimeWindow) => {
+    async (tw: TimeWindow, force = false) => {
       setLoading(true);
       setError("");
 
       try {
-        setDigest(await fetchDigest({ timeWindow: tw, router }));
+        setDigest(await fetchDigest({ timeWindow: tw, router, force }));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unable to generate briefing.");
       } finally {
@@ -106,7 +106,7 @@ export default function BriefingPage() {
               Restore read
             </button>
             <button
-              onClick={() => generate(timeWindow)}
+              onClick={() => generate(timeWindow, true)}
               disabled={loading}
               className="inline-flex items-center gap-2 rounded-full bg-stone-950 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-700 disabled:opacity-50"
             >

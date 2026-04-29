@@ -21,12 +21,12 @@ export default function DigestPage() {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>("24h");
 
   const generate = useCallback(
-    async (tw: TimeWindow) => {
+    async (tw: TimeWindow, force = false) => {
       setLoading(true);
       setError("");
 
       try {
-        setDigest(await fetchDigest({ timeWindow: tw, router }));
+        setDigest(await fetchDigest({ timeWindow: tw, router, force }));
       } catch (error) {
         setError(error instanceof Error ? error.message : "Network error. Is the dev server running, and can it reach Glean?");
       } finally {
@@ -94,7 +94,7 @@ export default function DigestPage() {
           </button>
 
           <button
-            onClick={() => generate(timeWindow)}
+            onClick={() => generate(timeWindow, true)}
             disabled={loading}
             className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-stone-600 transition-colors hover:bg-stone-100 disabled:opacity-50"
           >
@@ -127,7 +127,7 @@ export default function DigestPage() {
             <span className="text-3xl">⚠️</span>
             <p className="text-sm font-medium text-stone-700">{error}</p>
             <button
-              onClick={() => generate(timeWindow)}
+              onClick={() => generate(timeWindow, true)}
               className="rounded-xl bg-stone-900 px-4 py-2 text-sm text-white hover:bg-stone-700"
             >
               Try again
