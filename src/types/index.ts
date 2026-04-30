@@ -17,6 +17,7 @@ export interface GleanDocumentMetadata {
   container?: string;
   containerId?: string;
   containerUrl?: string;
+  documentId?: string;
   updateTime?: string;
   createTime?: string;
   author?: GleanAuthor;
@@ -127,6 +128,9 @@ export interface DigestData {
   debug?: {
     slackResults?: number;
     phase?: string;
+    queryCount?: number;
+    searchPages?: number;
+    timingsMs?: Record<string, number>;
   };
 }
 

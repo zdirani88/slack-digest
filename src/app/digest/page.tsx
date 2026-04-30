@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { DigestData, TimeWindow } from "@/types";
 import DigestView from "@/components/DigestView";
@@ -17,25 +17,47 @@ export default function DigestPage() {
   const router = useRouter();
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("Starting digest...");
   const [error, setError] = useState("");
   const [timeWindow, setTimeWindow] = useState<TimeWindow>("24h");
+  const requestIdRef = useRef(0);
 
   const generate = useCallback(
     async (tw: TimeWindow, force = false) => {
+      const requestId = requestIdRef.current + 1;
+      requestIdRef.current = requestId;
       setLoading(true);
       setError("");
+      setLoadingMessage("Starting digest...");
 
       try {
-        setDigest(await fetchDigest({
+        const nextDigest = await fetchDigest({
           timeWindow: tw,
           router,
           force,
-          onProgress: (nextDigest) => setDigest(nextDigest),
-        }));
+          onProgress: (progressDigest) => {
+            if (requestIdRef.current === requestId) {
+              setDigest(progressDigest);
+              setLoadingMessage(progressDigest.progressMessage ?? "Loading more Slack context...");
+            }
+          },
+          onStatus: (status) => {
+            if (requestIdRef.current === requestId) {
+              setLoadingMessage(status.message);
+            }
+          },
+        });
+        if (requestIdRef.current === requestId) {
+          setDigest(nextDigest);
+        }
       } catch (error) {
-        setError(error instanceof Error ? error.message : "Network error. Is the dev server running, and can it reach Glean?");
+        if (requestIdRef.current === requestId) {
+          setError(error instanceof Error ? error.message : "Network error. Is the dev server running, and can it reach Glean?");
+        }
       } finally {
-        setLoading(false);
+        if (requestIdRef.current === requestId) {
+          setLoading(false);
+        }
       }
     },
     [router]
@@ -122,14 +144,17 @@ export default function DigestPage() {
           <div className="flex flex-1 flex-col items-center justify-center gap-3">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-stone-200 border-t-amber-600" />
             <p className="text-sm text-stone-400">
-              Fetching Slack content for {TIME_WINDOW_LABELS[timeWindow]}…
+              {loadingMessage || `Fetching Slack content for ${TIME_WINDOW_LABELS[timeWindow]}...`}
+            </p>
+            <p className="max-w-sm text-center text-xs leading-5 text-stone-400">
+              The first batch should appear as soon as Glean returns search results. Better summaries keep loading after that.
             </p>
           </div>
         )}
 
         {loading && digest && (
           <div className="pointer-events-none fixed bottom-5 left-1/2 z-20 -translate-x-1/2 rounded-full border border-stone-200 bg-white/95 px-4 py-2 text-xs font-semibold text-stone-600 shadow-lg backdrop-blur">
-            {digest.progressMessage ?? "Improving summaries in the background..."}
+            {loadingMessage || digest.progressMessage || "Improving summaries in the background..."}
           </div>
         )}
 

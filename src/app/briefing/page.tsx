@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { BriefingData, BriefingStory, DigestData, TimeWindow } from "@/types";
 import { buildBriefing } from "@/lib/briefing";
@@ -22,8 +22,10 @@ export default function BriefingPage() {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [timeWindow, setTimeWindow] = useState<TimeWindow>("24h");
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("Starting briefing...");
   const [error, setError] = useState("");
   const [readStoryIds, setReadStoryIds] = useState<Set<string>>(new Set());
+  const requestIdRef = useRef(0);
   const briefing = useMemo(() => (digest ? filterReadStories(buildBriefing(digest), readStoryIds) : null), [digest, readStoryIds]);
 
   useEffect(() => {
@@ -37,20 +39,40 @@ export default function BriefingPage() {
 
   const generate = useCallback(
     async (tw: TimeWindow, force = false) => {
+      const requestId = requestIdRef.current + 1;
+      requestIdRef.current = requestId;
       setLoading(true);
       setError("");
+      setLoadingMessage("Starting briefing...");
 
       try {
-        setDigest(await fetchDigest({
+        const nextDigest = await fetchDigest({
           timeWindow: tw,
           router,
           force,
-          onProgress: (nextDigest) => setDigest(nextDigest),
-        }));
+          onProgress: (progressDigest) => {
+            if (requestIdRef.current === requestId) {
+              setDigest(progressDigest);
+              setLoadingMessage(progressDigest.progressMessage ?? "Loading more Slack context...");
+            }
+          },
+          onStatus: (status) => {
+            if (requestIdRef.current === requestId) {
+              setLoadingMessage(status.message);
+            }
+          },
+        });
+        if (requestIdRef.current === requestId) {
+          setDigest(nextDigest);
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Unable to generate briefing.");
+        if (requestIdRef.current === requestId) {
+          setError(err instanceof Error ? err.message : "Unable to generate briefing.");
+        }
       } finally {
-        setLoading(false);
+        if (requestIdRef.current === requestId) {
+          setLoading(false);
+        }
       }
     },
     [router]
@@ -153,7 +175,10 @@ export default function BriefingPage() {
         {loading && !briefing && (
           <div className="flex min-h-[420px] flex-col items-center justify-center gap-3">
             <div className="h-9 w-9 animate-spin rounded-full border-2 border-stone-300 border-t-stone-950" />
-            <p className="text-sm font-semibold text-stone-500">Composing today’s edition…</p>
+            <p className="text-sm font-semibold text-stone-500">{loadingMessage || "Composing today's edition..."}</p>
+            <p className="max-w-sm text-center text-xs leading-5 text-stone-400">
+              Headlines will appear from the first Slack search batch, then improve as summaries finish.
+            </p>
           </div>
         )}
 
@@ -181,7 +206,7 @@ export default function BriefingPage() {
 
         {loading && briefing && (
           <div className="pointer-events-none fixed bottom-5 left-1/2 z-20 -translate-x-1/2 rounded-full border border-stone-300 bg-white/95 px-4 py-2 text-xs font-bold text-stone-600 shadow-lg">
-            {briefing.progressMessage ?? "Updating the edition as richer summaries arrive..."}
+            {loadingMessage || briefing.progressMessage || "Updating the edition as richer summaries arrive..."}
           </div>
         )}
 
@@ -256,10 +281,14 @@ function LeadStory({
       <article className="flex min-w-0 flex-col">
         <StoryKicker story={story} label={`Lead Story · ${story.section}`} />
         <h2 className="mt-3 max-w-full overflow-hidden break-words font-serif text-3xl font-black leading-[0.98] text-stone-950 md:text-4xl xl:text-5xl">{story.headline}</h2>
-        <p className="mt-4 max-w-3xl text-lg leading-8 text-stone-700">{story.dek}</p>
+        <p className="mt-4 max-w-3xl text-lg leading-8 text-stone-700">
+          <LinkedText text={story.dek} />
+        </p>
         <div className="mt-5 space-y-3 overflow-hidden break-words text-base leading-8 text-stone-800">
           {story.body.slice(0, 2).map((paragraph, index) => (
-            <p key={index}>{paragraph}</p>
+            <p key={index} className="min-w-0 overflow-hidden">
+              <LinkedText text={paragraph} />
+            </p>
           ))}
         </div>
         <StoryLinks story={story} onRead={onRead} onDownvote={onDownvote} />
@@ -269,10 +298,12 @@ function LeadStory({
         <article className="flex min-w-0 flex-col rounded-3xl border border-stone-300 bg-white/55 p-5 shadow-sm">
           <StoryKicker story={secondaryStory} label={`Also Important · ${secondaryStory.section}`} />
           <h3 className="mt-3 overflow-hidden break-words font-serif text-3xl font-black leading-tight text-stone-950">{secondaryStory.headline}</h3>
-          <p className="mt-3 text-base leading-7 text-stone-700">{secondaryStory.dek}</p>
+          <p className="mt-3 text-base leading-7 text-stone-700">
+            <LinkedText text={secondaryStory.dek} />
+          </p>
           <div className="mt-4 overflow-hidden break-words rounded-2xl border border-amber-200 bg-amber-50/80 p-4 text-sm leading-6 text-amber-950">
             <span className="font-black uppercase tracking-wide text-amber-800">Why it matters: </span>
-            {secondaryStory.whyItMatters}
+            <LinkedText text={secondaryStory.whyItMatters} />
           </div>
           <div className="mt-auto">
             <StoryLinks story={secondaryStory} onRead={onRead} onDownvote={onDownvote} />
@@ -296,7 +327,9 @@ function SmallStory({
     <article className="min-w-0 border-l border-stone-300 pl-4">
       <StoryKicker story={story} label={story.section} />
       <h3 className="mt-2 overflow-hidden break-words font-serif text-2xl font-black leading-7">{story.headline}</h3>
-      <p className="mt-2 text-sm leading-6 text-stone-600">{story.dek}</p>
+      <p className="mt-2 text-sm leading-6 text-stone-600">
+        <LinkedText text={story.dek} />
+      </p>
       <StoryLinks story={story} compact onRead={onRead} onDownvote={onDownvote} />
     </article>
   );
@@ -315,15 +348,19 @@ function ArticleStory({
     <article className="min-w-0 overflow-hidden">
       <StoryKicker story={story} label={story.section} />
       <h3 className="mt-1 overflow-hidden break-words font-serif text-2xl font-black leading-7">{story.headline}</h3>
-      <p className="mt-2 text-sm font-semibold leading-6 text-stone-600">{story.dek}</p>
+      <p className="mt-2 text-sm font-semibold leading-6 text-stone-600">
+        <LinkedText text={story.dek} />
+      </p>
       <div className="mt-3 space-y-3 overflow-hidden break-words text-sm leading-7 text-stone-800">
         {story.body.map((paragraph, index) => (
-          <p key={index}>{paragraph}</p>
+          <p key={index} className="min-w-0 overflow-hidden">
+            <LinkedText text={paragraph} />
+          </p>
         ))}
       </div>
       <div className="mt-3 overflow-hidden break-words rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs leading-5 text-amber-950">
         <span className="font-black uppercase tracking-wide text-amber-800">Why it matters: </span>
-        {story.whyItMatters}
+        <LinkedText text={story.whyItMatters} />
       </div>
       <StoryLinks story={story} onRead={onRead} onDownvote={onDownvote} />
     </article>
@@ -342,7 +379,7 @@ function StoryLinks({
   onDownvote: (story: BriefingStory) => void;
 }) {
   return (
-    <div className={`mt-5 flex flex-wrap items-center gap-2 ${compact ? "text-xs" : "text-sm"}`}>
+    <div className={`mt-5 flex max-w-full flex-wrap items-center gap-2 overflow-hidden ${compact ? "text-xs" : "text-sm"}`}>
       <button
         onClick={() => onRead(story)}
         className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-semibold text-emerald-800 hover:bg-emerald-100"
@@ -364,12 +401,12 @@ function StoryLinks({
             href={channel.url}
             target="_blank"
             rel="noreferrer"
-            className="rounded-full border border-stone-300 bg-white/70 px-3 py-1 font-semibold text-stone-600 hover:bg-white"
+            className="max-w-full truncate rounded-full border border-stone-300 bg-white/70 px-3 py-1 font-semibold text-stone-600 hover:bg-white"
           >
             #{channel.name}
           </a>
         ) : (
-          <span key={channel.name} className="rounded-full border border-stone-300 bg-white/70 px-3 py-1 font-semibold text-stone-600">
+          <span key={channel.name} className="max-w-full truncate rounded-full border border-stone-300 bg-white/70 px-3 py-1 font-semibold text-stone-600">
             #{channel.name}
           </span>
         )
@@ -396,6 +433,75 @@ function StoryKicker({ story, label }: { story: BriefingStory; label: string }) 
       {story.timestamp ? <span className="ml-2 tracking-normal text-stone-400">· {formatStoryTime(story.timestamp)}</span> : null}
     </p>
   );
+}
+
+function LinkedText({ text }: { text: string }) {
+  const parts = splitLinks(text);
+
+  return (
+    <>
+      {parts.map((part, index) =>
+        part.href ? (
+          <a
+            key={`${part.href}-${index}`}
+            href={part.href}
+            target="_blank"
+            rel="noreferrer"
+            title={part.href}
+            className="inline-flex max-w-full align-baseline font-semibold text-blue-700 underline decoration-blue-300 underline-offset-2 hover:text-blue-900"
+          >
+            <span className="max-w-[18rem] truncate">{shortenUrl(part.href)}</span>
+          </a>
+        ) : (
+          <span key={`${part.text}-${index}`}>{part.text}</span>
+        )
+      )}
+    </>
+  );
+}
+
+function splitLinks(text: string) {
+  const urlRegex = /(https?:\/\/[^\s)]+)([).,;:]*)/g;
+  const parts: Array<{ text: string; href?: string }> = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = urlRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ text: text.slice(lastIndex, match.index) });
+    }
+
+    parts.push({ text: match[1], href: match[1] });
+    if (match[2]) {
+      parts.push({ text: match[2] });
+    }
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push({ text: text.slice(lastIndex) });
+  }
+
+  return parts.length ? parts : [{ text }];
+}
+
+function shortenUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, "");
+    const path = parsed.pathname.split("/").filter(Boolean);
+    const firstPath = path[0] ? `/${path[0]}` : "";
+    const secondPath = path[1] ? `/${truncateMiddle(path[1], 18)}` : "";
+    return `${host}${firstPath}${secondPath}`;
+  } catch {
+    return truncateMiddle(url, 36);
+  }
+}
+
+function truncateMiddle(value: string, maxLength: number) {
+  if (value.length <= maxLength) return value;
+  const side = Math.floor((maxLength - 1) / 2);
+  return `${value.slice(0, side)}…${value.slice(-side)}`;
 }
 
 function filterReadStories(briefing: BriefingData, readStoryIds: Set<string>): BriefingData {

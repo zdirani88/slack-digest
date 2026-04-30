@@ -1,5 +1,10 @@
 import { NextRequest } from "next/server";
-import { generateDigestViaGleanChat, generateFastDigestFromResults, searchSlack } from "@/lib/glean";
+import {
+  generateDigestViaGleanChat,
+  generateFastDigestFromResults,
+  searchSlack,
+  searchSlackFast,
+} from "@/lib/glean";
 import { DigestData, DigestPreferences, TimeWindow } from "@/types";
 
 type StreamEvent =
@@ -21,6 +26,7 @@ export async function POST(req: NextRequest) {
 
   let timeWindow: TimeWindow = "24h";
   let preferences: DigestPreferences = {};
+  let force = req.headers.get("x-digest-force") === "true";
   try {
     const body = await req.json();
     if (["24h", "3d", "7d"].includes(body.timeWindow)) {
@@ -28,6 +34,9 @@ export async function POST(req: NextRequest) {
     }
     if (body.preferences && typeof body.preferences === "object") {
       preferences = body.preferences;
+    }
+    if (body.force === true) {
+      force = true;
     }
   } catch {
     // Use defaults for malformed or empty bodies.
@@ -43,7 +52,24 @@ export async function POST(req: NextRequest) {
       };
 
       try {
-        const cached = getServerCache(cacheKey);
+        const startedAt = Date.now();
+        const phaseStartedAt = new Map<string, number>([["search", startedAt]]);
+        const timingsMs: Record<string, number> = {};
+        let latestQueryCount: number | undefined;
+        let latestSearchPages: number | undefined;
+        let paintedFastDigest = false;
+        let lastProgressDigestAt = 0;
+        const finishPhase = (phase: string) => {
+          const phaseStart = phaseStartedAt.get(phase);
+          if (phaseStart !== undefined) {
+            timingsMs[phase] = Date.now() - phaseStart;
+          }
+        };
+        const startPhase = (phase: string) => {
+          phaseStartedAt.set(phase, Date.now());
+        };
+
+        const cached = force ? null : getServerCache(cacheKey);
         if (cached) {
           send({
             type: "complete",
@@ -57,7 +83,72 @@ export async function POST(req: NextRequest) {
         }
 
         send({ type: "status", phase: "search", message: "Searching Slack in Glean..." });
-        const results = await searchSlack(timeWindow, token, backendUrl, preferences);
+        const fastSearchPromise = searchSlackFast(timeWindow, token, backendUrl, preferences, (progress) => {
+          latestQueryCount = progress.queryCount;
+          latestSearchPages = progress.searchPages;
+          if (progress.results.length === 0 || paintedFastDigest) {
+            return;
+          }
+
+          paintedFastDigest = true;
+          send({
+            type: "digest",
+            digest: {
+              ...generateFastDigestFromResults(progress.results, timeWindow),
+              progressMessage: `Showing ${progress.results.length} quick Slack results while deeper search continues...`,
+              debug: {
+                slackResults: progress.results.length,
+                phase: "fast_lane",
+                queryCount: progress.queryCount,
+                searchPages: progress.searchPages,
+              },
+            },
+          });
+        }).catch(() => []);
+        const fullSearchPromise = searchSlack(timeWindow, token, backendUrl, preferences, (progress) => {
+          latestQueryCount = progress.queryCount;
+          latestSearchPages = progress.searchPages;
+          const now = Date.now();
+          if (progress.results.length === 0 || now - lastProgressDigestAt < 650) {
+            return;
+          }
+
+          lastProgressDigestAt = now;
+          send({
+            type: "digest",
+            digest: {
+              ...generateFastDigestFromResults(progress.results, timeWindow),
+              progressMessage: `Loaded ${progress.results.length} Slack items so far...`,
+              debug: {
+                slackResults: progress.results.length,
+                phase: "search_progress",
+                queryCount: progress.queryCount,
+                searchPages: progress.searchPages,
+              },
+            },
+          });
+        });
+
+        const fastResults = await fastSearchPromise;
+        if (fastResults.length > 0 && !paintedFastDigest) {
+          paintedFastDigest = true;
+          send({
+            type: "digest",
+            digest: {
+              ...generateFastDigestFromResults(fastResults, timeWindow),
+              progressMessage: `Showing ${fastResults.length} quick Slack results while deeper search continues...`,
+              debug: {
+                slackResults: fastResults.length,
+                phase: "fast_lane",
+                queryCount: latestQueryCount,
+                searchPages: latestSearchPages,
+              },
+            },
+          });
+        }
+
+        const results = await fullSearchPromise;
+        finishPhase("search");
 
         if (results.length === 0) {
           const emptyDigest = {
@@ -73,22 +164,40 @@ export async function POST(req: NextRequest) {
           return;
         }
 
+        startPhase("fast_digest");
         send({ type: "status", phase: "fast_digest", message: `Found ${results.length} Slack items. Ranking a first pass...` });
+        const fastDigest = generateFastDigestFromResults(results, timeWindow);
+        finishPhase("fast_digest");
         send({
           type: "digest",
           digest: {
-            ...generateFastDigestFromResults(results, timeWindow),
-            debug: { slackResults: results.length, phase: "fast_digest" },
+            ...fastDigest,
+            debug: {
+              slackResults: results.length,
+              phase: "fast_digest",
+              queryCount: latestQueryCount,
+              searchPages: latestSearchPages,
+              timingsMs: { ...timingsMs },
+            },
           },
         });
 
+        startPhase("ai_digest");
         send({ type: "status", phase: "ai_digest", message: "Writing AI summaries and action suggestions..." });
         const digest = await generateDigestViaGleanChat(results, timeWindow, token, backendUrl);
+        finishPhase("ai_digest");
+        timingsMs.total = Date.now() - startedAt;
         const completeDigest: DigestData = {
           ...digest,
           status: "complete",
           progressMessage: "Digest is fully enriched.",
-          debug: { slackResults: results.length, phase: "complete" },
+          debug: {
+            slackResults: results.length,
+            phase: "complete",
+            queryCount: latestQueryCount,
+            searchPages: latestSearchPages,
+            timingsMs,
+          },
         };
         setServerCache(cacheKey, completeDigest);
         send({

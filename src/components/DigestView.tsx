@@ -219,7 +219,7 @@ export default function DigestView({ digest }: Props) {
 
   return (
     <div className="grid min-h-0 flex-1 grid-cols-1 bg-slate-50 text-slate-900 xl:grid-cols-[260px_minmax(380px,0.9fr)_minmax(420px,1.1fr)]">
-      <aside className="min-h-0 border-b border-slate-200 bg-white xl:border-b-0 xl:border-r">
+      <aside className="min-h-0 overflow-y-auto border-b border-slate-200 bg-white xl:border-b-0 xl:border-r">
         <div className="border-b border-slate-200 px-4 py-4">
           <div className="flex items-center justify-between">
             <div>
@@ -297,7 +297,7 @@ export default function DigestView({ digest }: Props) {
           </div>
         </div>
 
-        <nav className="flex gap-2 overflow-x-auto px-3 py-3 xl:block xl:space-y-1 xl:overflow-y-auto">
+        <nav className="flex gap-2 overflow-x-auto px-3 py-3 xl:block xl:space-y-1 xl:overflow-visible">
           {navGroups.map((group) => (
             <button
               key={group.id}
@@ -332,6 +332,9 @@ export default function DigestView({ digest }: Props) {
             <Layers3 className="h-3.5 w-3.5" />
             <span>Generated {formatDistanceToNow(new Date(digest.generatedAt), { addSuffix: true })}</span>
           </div>
+          {formatDebugMetrics(digest) ? (
+            <div className="mt-1 text-[11px] text-slate-400">{formatDebugMetrics(digest)}</div>
+          ) : null}
         </div>
       </aside>
 
@@ -622,6 +625,24 @@ function formatDisplayTime(value: string) {
   const day = date.toLocaleDateString(undefined, { weekday: "short" });
   const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }).replace(":00", "");
   return `${day} ${time}`;
+}
+
+function formatDebugMetrics(digest: DigestData) {
+  const debug = digest.debug;
+  if (!debug) return "";
+
+  const parts = [
+    debug.slackResults !== undefined ? `${debug.slackResults} results` : "",
+    debug.searchPages !== undefined ? `${debug.searchPages} pages` : "",
+    debug.timingsMs?.search !== undefined ? `search ${formatMs(debug.timingsMs.search)}` : "",
+    debug.timingsMs?.ai_digest !== undefined ? `AI ${formatMs(debug.timingsMs.ai_digest)}` : "",
+  ].filter(Boolean);
+
+  return parts.join(" · ");
+}
+
+function formatMs(value: number) {
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${value}ms`;
 }
 
 function rankItems(items: DigestItem[], sortMode: SortMode, interests: string[], feedback: FeedbackMap) {

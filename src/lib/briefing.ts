@@ -62,7 +62,7 @@ function storyFromItem(group: DigestGroup, item: DigestItem): BriefingStory {
     channels: channel,
     slackUrls: item.url ? [item.url] : [],
     score,
-    sourceItemIds: [item.id],
+    sourceItemIds: [item.id, item.url].filter((value): value is string => Boolean(value)),
     timestamp: item.latestActivityTimestamp || item.timestamp || item.originalTimestamp,
   };
 }

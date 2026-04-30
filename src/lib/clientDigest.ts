@@ -6,11 +6,13 @@ export async function fetchDigest({
   router,
   force = false,
   onProgress,
+  onStatus,
 }: {
   timeWindow: TimeWindow;
   router: AppRouterInstance;
   force?: boolean;
   onProgress?: (digest: DigestData) => void;
+  onStatus?: (status: { phase?: string; message: string }) => void;
 }): Promise<DigestData> {
   const token = localStorage.getItem("glean_token");
   const backendUrl = localStorage.getItem("glean_backend_url");
@@ -22,6 +24,10 @@ export async function fetchDigest({
 
   const preferences = readDigestPreferences();
   const cacheKey = makeDigestCacheKey(timeWindow, backendUrl, preferences);
+
+  if (force) {
+    clearCache(cacheKey);
+  }
 
   if (!force) {
     const memoryHit = getMemoryCache(cacheKey);
@@ -37,7 +43,7 @@ export async function fetchDigest({
     if (inflight) return inflight;
   }
 
-  const request = requestDigest({ timeWindow, token, backendUrl, preferences, onProgress }).then((digest) => {
+  const request = requestDigest({ timeWindow, token, backendUrl, preferences, force, onProgress, onStatus }).then((digest) => {
     setMemoryCache(cacheKey, digest);
     setStorageCache(cacheKey, digest);
     return digest;
@@ -61,13 +67,17 @@ async function requestDigest({
   token,
   backendUrl,
   preferences,
+  force,
   onProgress,
+  onStatus,
 }: {
   timeWindow: TimeWindow;
   token: string;
   backendUrl: string;
   preferences: DigestPreferences;
+  force: boolean;
   onProgress?: (digest: DigestData) => void;
+  onStatus?: (status: { phase?: string; message: string }) => void;
 }) {
   const res = await fetch("/api/digest/stream", {
     method: "POST",
@@ -75,8 +85,9 @@ async function requestDigest({
       "Content-Type": "application/json",
       "x-glean-token": token,
       "x-glean-backend": backendUrl,
+      "x-digest-force": force ? "true" : "false",
     },
-    body: JSON.stringify({ timeWindow, preferences }),
+    body: JSON.stringify({ timeWindow, preferences, force }),
   });
 
   if (!res.ok) {
@@ -110,6 +121,10 @@ async function requestDigest({
         throw new Error(formatErrorMessage(event.error));
       }
 
+      if (event.type === "status" && event.message) {
+        onStatus?.({ phase: event.phase, message: event.message });
+      }
+
       if ((event.type === "digest" || event.type === "complete") && event.digest) {
         latestDigest = event.digest;
         onProgress?.(latestDigest);
@@ -121,6 +136,9 @@ async function requestDigest({
     const event = parseStreamEvent(buffer);
     if (event?.type === "error") {
       throw new Error(formatErrorMessage(event.error));
+    }
+    if (event?.type === "status" && event.message) {
+      onStatus?.({ phase: event.phase, message: event.message });
     }
     if ((event?.type === "digest" || event?.type === "complete") && event.digest) {
       latestDigest = event.digest;
@@ -139,6 +157,8 @@ function parseStreamEvent(line: string): null | {
   type?: string;
   digest?: DigestData;
   error?: string;
+  phase?: string;
+  message?: string;
 } {
   try {
     const value = JSON.parse(line);
@@ -186,6 +206,16 @@ function getStorageCache(key: string) {
 function setStorageCache(key: string, digest: DigestData) {
   try {
     sessionStorage.setItem(key, JSON.stringify({ digest, cachedAt: Date.now() }));
+  } catch {
+    // Cache storage is a convenience only.
+  }
+}
+
+function clearCache(key: string) {
+  MEMORY_CACHE.delete(key);
+  INFLIGHT.delete(key);
+  try {
+    sessionStorage.removeItem(key);
   } catch {
     // Cache storage is a convenience only.
   }

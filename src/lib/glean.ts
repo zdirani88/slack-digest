@@ -61,11 +61,77 @@ type SearchQueryPlan = {
   broad?: boolean;
 };
 
+type SearchPageOptions = {
+  pageSize?: number;
+  maxSnippetSize?: number;
+  returnLlmContentOverSnippets?: boolean;
+  timeoutMs?: number;
+};
+
+export type SearchProgress = {
+  results: GleanSearchResult[];
+  query: string;
+  page: number;
+  queryCount: number;
+  searchPages: number;
+};
+
+export type FastSearchProgress = SearchProgress & {
+  source: "fast";
+};
+
+export async function searchSlackFast(
+  timeWindow: TimeWindow,
+  token: string,
+  backendUrl: string,
+  preferences: DigestPreferences = {},
+  onProgress?: (progress: FastSearchProgress) => void
+): Promise<GleanSearchResult[]> {
+  const url = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/search`;
+  const timeRange = getTimeRange(timeWindow);
+  const queries = buildFastSearchQueries(preferences);
+  const collected: GleanSearchResult[] = [];
+  let settledQueries = 0;
+
+  await Promise.allSettled(
+    queries.map(async ({ query }, queryIndex) => {
+      const data = await fetchSearchPage({
+        url,
+        token,
+        query,
+        timeRange,
+        options: {
+          pageSize: 10,
+          maxSnippetSize: 500,
+          returnLlmContentOverSnippets: false,
+          timeoutMs: 8000,
+        },
+      });
+      const slackResults = (data.results ?? []).filter(isSlackResult);
+      const expanded = slackResults.flatMap(expandSlackResult);
+
+      collected.push(...expanded);
+      settledQueries += 1;
+      onProgress?.({
+        source: "fast",
+        results: dedupeSlackResults(collected).slice(0, 80),
+        query,
+        page: 1,
+        queryCount: queryIndex + 1,
+        searchPages: settledQueries,
+      });
+    })
+  );
+
+  return dedupeSlackResults(collected).slice(0, 80);
+}
+
 export async function searchSlack(
   timeWindow: TimeWindow,
   token: string,
   backendUrl: string,
-  preferences: DigestPreferences = {}
+  preferences: DigestPreferences = {},
+  onProgress?: (progress: SearchProgress) => void
 ): Promise<GleanSearchResult[]> {
   const url = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/search`;
   const timeRange = getTimeRange(timeWindow);
@@ -74,8 +140,10 @@ export async function searchSlack(
   const collected: GleanSearchResult[] = [];
   const errors: string[] = [];
   let hitRateLimit = false;
+  let searchPages = 0;
 
-  for (const { query, pages, broad } of queries) {
+  for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
+    const { query, pages, broad } = queries[queryIndex];
     if (dedupeSlackResults(collected).length >= SEARCH_TARGET_RESULTS) {
       break;
     }
@@ -99,6 +167,15 @@ export async function searchSlack(
         const slackResults = (data.results ?? []).filter(isSlackResult);
         const expanded = slackResults.flatMap(expandSlackResult);
         collected.push(...expanded);
+        searchPages += 1;
+
+        onProgress?.({
+          results: dedupeSlackResults(collected).slice(0, 220),
+          query,
+          page: page + 1,
+          queryCount: queryIndex + 1,
+          searchPages,
+        });
 
         if (!data.hasMoreResults || !data.cursor) {
           break;
@@ -130,13 +207,16 @@ export async function searchSlack(
 }
 
 function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
+  const fastFirstQueries: SearchQueryPlan[] = [
+    { query: "", pages: 1, broad: true },
+  ];
   const priorityQueries: SearchQueryPlan[] = [
     { query: "@zubin", pages: 1 },
     { query: "arvind", pages: 1 },
     { query: "urgent blocker decision", pages: 1 },
   ];
   const baseQueries: SearchQueryPlan[] = [
-    { query: "", pages: 3, broad: true },
+    { query: "", pages: 2, broad: true },
     { query: "thread", pages: 2, broad: true },
     { query: "incident regression outage debug", pages: 1 },
     { query: "architecture implementation infra deployment", pages: 1 },
@@ -161,13 +241,42 @@ function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
       ...(preferences.dislikedAuthors ?? []),
     ].map((value) => value.toLowerCase())
   );
-  const merged = [...preferredQueries, ...priorityQueries, ...baseQueries].filter(({ query }) => {
+  const merged = [...fastFirstQueries, ...preferredQueries, ...priorityQueries, ...baseQueries].filter(({ query }) => {
     const normalized = query.toLowerCase();
     return !normalized || !disliked.has(normalized);
   });
   const seen = new Set<string>();
 
   return merged.filter(({ query }) => {
+    const key = query.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildFastSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
+  const preferredQueries = [
+    ...(preferences.interests ?? []),
+    ...(preferences.likedTopics ?? []),
+    ...(preferences.likedChannels ?? []).map((channel) => channel.replace(/^#/, "")),
+    ...(preferences.likedAuthors ?? []),
+  ]
+    .map((query) => query.trim())
+    .filter((query) => query.length > 2)
+    .slice(0, 2)
+    .map((query) => ({ query, pages: 1 }));
+
+  const queries: SearchQueryPlan[] = [
+    ...preferredQueries,
+    { query: "@zubin", pages: 1 },
+    { query: "thread", pages: 1, broad: true },
+    { query: "urgent blocker decision", pages: 1 },
+    { query: "", pages: 1, broad: true },
+  ];
+  const seen = new Set<string>();
+
+  return queries.filter(({ query }) => {
     const key = query.toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
@@ -371,7 +480,7 @@ function buildMessageCandidates(results: GleanSearchResult[]): MessageCandidate[
     );
 
     return {
-      id: `item_${i}`,
+      id: getStableResultId(r, i),
       title: r.title ?? "Untitled",
       channel: r.document?.metadata?.container ?? "unknown",
       channelUrl: r.document?.metadata?.containerUrl ?? deriveSlackChannelUrl(webUrl || appUrl),
@@ -387,6 +496,25 @@ function buildMessageCandidates(results: GleanSearchResult[]): MessageCandidate[
       graphContext: emptyGraphContext(),
     };
   });
+}
+
+function getStableResultId(result: GleanSearchResult, index: number) {
+  const metadata = result.document?.metadata;
+  const stable =
+    result.document?.id ??
+    metadata?.documentId ??
+    result.nativeAppUrl ??
+    result.url ??
+    [
+      metadata?.container,
+      metadata?.createTime,
+      metadata?.updateTime,
+      result.title,
+    ]
+      .filter(Boolean)
+      .join(":");
+
+  return stable || `result_${index}`;
 }
 
 const GROUP_META: Array<{ id: string; title: string; emoji: string; priority: number }> = [
@@ -425,12 +553,14 @@ async function fetchSearchPage({
   query,
   timeRange,
   cursor,
+  options = {},
 }: {
   url: string;
   token: string;
   query: string;
   timeRange: { startTimestamp: number; endTimestamp: number };
   cursor?: string;
+  options?: SearchPageOptions;
 }) {
   const res = await fetchWithRetry(url, {
     method: "POST",
@@ -441,13 +571,13 @@ async function fetchSearchPage({
     body: JSON.stringify({
       query,
       datasourceFilter: "SLACK",
-      pageSize: 35,
+      pageSize: options.pageSize ?? 35,
       timeRange,
-      returnLlmContentOverSnippets: true,
-      maxSnippetSize: 2500,
+      returnLlmContentOverSnippets: options.returnLlmContentOverSnippets ?? true,
+      maxSnippetSize: options.maxSnippetSize ?? 2500,
       ...(cursor ? { cursor } : {}),
     }),
-  });
+  }, 0, options.timeoutMs);
 
   if (!res.ok) {
     const body = await readErrorBody(res);
@@ -883,9 +1013,9 @@ function normalizeActions(value: unknown): DigestAction[] | undefined {
   return actions.length ? actions.slice(0, 3) : undefined;
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, attempt = 0): Promise<Response> {
+async function fetchWithRetry(url: string, init: RequestInit, attempt = 0, timeoutMs = GLEAN_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), GLEAN_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     return await fetch(url, {
@@ -895,7 +1025,7 @@ async function fetchWithRetry(url: string, init: RequestInit, attempt = 0): Prom
   } catch (error) {
     if (attempt < 1) {
       await sleep(400 * (attempt + 1));
-      return fetchWithRetry(url, init, attempt + 1);
+      return fetchWithRetry(url, init, attempt + 1, timeoutMs);
     }
 
     throw normalizeFetchError(error);
