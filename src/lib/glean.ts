@@ -22,8 +22,9 @@ const OPTIONAL_GLEAN_TIMEOUT_MS = 5000;
 const SEARCH_TARGET_RESULTS = 190;
 const GRAPH_CONTEXT_LIMIT = 16;
 const AI_MESSAGE_LIMIT = 60;
-const AI_ENRICHMENT_LIMIT = 36;
+const AI_ENRICHMENT_LIMIT = 20;
 const PEOPLE_BOOST_CACHE = new Map<string, number>();
+const AI_ENRICHMENT_CACHE = new Map<string, AiDigestEnrichment>();
 
 type MessageCandidate = {
   id: string;
@@ -290,12 +291,6 @@ export async function generateDigestViaGleanChat(
   token: string,
   backendUrl: string
 ): Promise<DigestData> {
-  const timeLabels: Record<TimeWindow, string> = {
-    "24h": "24 hours",
-    "3d": "3 days",
-    "7d": "7 days",
-  };
-
   const messages = buildMessageCandidates(results);
 
   // Keep the AI prompt bounded even when retrieval gets much broader.
@@ -318,124 +313,8 @@ export async function generateDigestViaGleanChat(
     token,
     backendUrl
   ).catch(() => new Map<string, AiDigestEnrichment>());
-
-  const prompt = `You are a Slack digest assistant for Zubin. Below are ${aiMessages.length} Slack messages/threads from the past ${timeLabels[timeWindow]}.
-
-Organize them into these 8 categories. Return ONLY valid JSON, no markdown fences, no explanation.
-You must include every provided message exactly once by id. If you are unsure about a category, choose the closest category, but do not omit the item.
-For each item, write a fresh one-line AI summary that answers "why should I care?" Do not copy the title unless it is already the clearest possible punchline.
-Also write a specific "reason" explaining why the item surfaced; do not use generic category descriptions.
-
-Categories:
-- system_issues: Human discussion about important incidents, regressions, bugs, outages, failures, security issues, debugging, root cause analysis
-- automated_alerts: Bot/app/system generated alerts, escalation forms, monitoring posts, Jira/GitHub/PagerDuty/Sentry style notifications
-- product_updates: Product launches, roadmap movement, feature changes, customer-facing product news
-- engineering_updates: Architecture, implementation, infra projects, technical design, non-incident engineering updates
-- ideas_and_innovations: Brainstorms, experiments, feature ideas, AI concepts, open-ended ideation
-- sales_updates: Pipeline, deals, prospects, revenue discussions, enablement, field asks
-- partnership_updates: Partners, partner launches, NVIDIA, customers, vendors, joint work, external collaboration
-- leadership_attention: Direct asks to Zubin, VIP/executive mentions, urgent decisions, leadership-visible items that are not primarily system issues or automated alerts
-
-JSON format:
-{
-  "groups": [
-    {
-      "id": "product_updates",
-      "title": "Product Updates",
-      "emoji": "🚀",
-      "summary": "2-3 sentence overview",
-      "items": [
-        {
-          "id": "item_0",
-          "title": "short descriptive title",
-          "channel": "channel-name",
-          "channelUrl": "url or empty string",
-          "summary": "one-line punchline, 90 characters max, answers why Zubin should care",
-          "preview": "1-2 sentence preview",
-          "rawExcerpt": "short excerpt from the original Slack text",
-          "threadSummary": "brief gist of the thread/comments",
-          "url": "original url or empty string",
-          "reason": "specific why surfaced explanation based on engagement, people, topic, channel, or freshness",
-          "timestamp": "ISO timestamp or empty string",
-          "author": "author name",
-          "suggestedActions": [
-            {
-              "id": "short_snake_case_id",
-              "label": "short action label",
-              "prompt": "pre-populated Glean prompt for this action",
-              "rationale": "why this action is useful"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}
-
-Use these exact group ids: leadership_attention, system_issues, automated_alerts, product_updates, engineering_updates, ideas_and_innovations, sales_updates, partnership_updates.
-Include all 8 groups even if empty (empty items array).
-Only put each item in the single most relevant group.
-Do not put bot/app generated system posts in leadership_attention. Put those in automated_alerts.
-If a human on Zubin's team, a VIP, or a key leader is discussing an incident or regression, put it in system_issues.
-Put technical design, architecture, implementation, infra, migration, API, backend/frontend, database, schema, performance, or release execution in engineering_updates unless it is primarily an incident.
-Put brainstorms, experiments, prototypes, proposals, "what if", "could we", and feature ideas in ideas_and_innovations even when the topic is product-adjacent.
-
-Messages with graph context:
-${JSON.stringify(aiMessages, null, 2)}`;
-
-  const chatUrl = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/chat`;
-
-  let parsed: { groups: DigestGroup[] };
-  try {
-    const res = await fetchWithRetry(chatUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        messages: [{ author: "USER", fragments: [{ text: prompt }] }],
-        stream: false,
-      }),
-    });
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`Glean chat ${res.status}: ${body}`);
-    }
-
-    const data = await res.json();
-
-    const responseMessages: Array<{ author?: string; fragments?: Array<{ text?: string }>; content?: string }> =
-      data.messages ?? data.followUpResults ?? [];
-    const aiMessage = responseMessages.find(
-      (m) => m.author === "GLEAN_AI" || m.author === "ASSISTANT"
-    ) ?? responseMessages[responseMessages.length - 1];
-
-    if (!aiMessage) throw new Error("Empty response from Glean chat");
-
-    const rawText =
-      aiMessage.fragments?.map((f) => f.text ?? "").join("") ??
-      aiMessage.content ??
-      "";
-
-    const jsonText = extractJsonObject(rawText);
-    parsed = JSON.parse(jsonText);
-  } catch {
-    const fallbackGroups = buildFallbackGroups(graphMessages, itemEnrichments);
-    parsed = {
-      groups: fallbackGroups.length > 0
-        ? fallbackGroups
-        : buildEmptyGroups("Fell back to local grouping because Glean summarization was unavailable."),
-    };
-  }
-
-  const groupsWithAllMessages = appendMissingMessages(
-    parsed.groups ?? [],
-    graphMessages,
-    itemEnrichments
-  );
-  const groups = enrichGroups(ensureAllGroups(groupsWithAllMessages), graphMessages, itemEnrichments);
+  const localGroups = buildFallbackGroups(aiMessages, itemEnrichments);
+  const groups = enrichGroups(ensureAllGroups(localGroups), graphMessages, itemEnrichments);
   const totalItems = groups.reduce((sum, g) => sum + g.items.length, 0);
 
   return {
@@ -863,18 +742,50 @@ async function generateItemEnrichmentsViaGleanChat(
   }
 
   const enrichments = new Map<string, AiDigestEnrichment>();
-  const batchSize = 15;
+  const pending: MessageCandidate[] = [];
 
-  for (let index = 0; index < messages.length; index += batchSize) {
-    const batch = messages.slice(index, index + batchSize);
-    const batchEnrichments = await generateItemEnrichmentBatchViaGleanChat(batch, token, backendUrl);
+  for (const message of messages) {
+    const cached = AI_ENRICHMENT_CACHE.get(getAiEnrichmentCacheKey(message));
+    if (cached) {
+      enrichments.set(message.id, cached);
+    } else {
+      pending.push(message);
+    }
+  }
 
+  if (pending.length === 0) {
+    return enrichments;
+  }
+
+  const batchSize = 10;
+  const batchPromises: Array<Promise<Map<string, AiDigestEnrichment>>> = [];
+
+  for (let index = 0; index < pending.length; index += batchSize) {
+    const batch = pending.slice(index, index + batchSize);
+    batchPromises.push(generateItemEnrichmentBatchViaGleanChat(batch, token, backendUrl));
+  }
+
+  const batchResults = await Promise.allSettled(batchPromises);
+  for (const result of batchResults) {
+    if (result.status !== "fulfilled") continue;
+    const batchEnrichments = result.value;
     for (const [id, enrichment] of Array.from(batchEnrichments.entries())) {
       enrichments.set(id, enrichment);
+      const message = pending.find((candidate) => candidate.id === id);
+      if (message) {
+        AI_ENRICHMENT_CACHE.set(getAiEnrichmentCacheKey(message), enrichment);
+      }
     }
   }
 
   return enrichments;
+}
+
+function getAiEnrichmentCacheKey(message: MessageCandidate) {
+  return [
+    message.id,
+    message.latestActivityTimestamp || message.timestamp || message.originalTimestamp,
+  ].join("::");
 }
 
 async function generateItemEnrichmentBatchViaGleanChat(
@@ -918,7 +829,7 @@ ${JSON.stringify(
     author: message.author,
     timestamp: message.latestActivityTimestamp || message.originalTimestamp || message.timestamp,
     signals: message.signals,
-    content: compactText(message.content).slice(0, 1200),
+    content: compactText(message.content).slice(0, 800),
   })),
   null,
   2
