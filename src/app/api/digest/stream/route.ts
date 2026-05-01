@@ -14,6 +14,7 @@ type StreamEvent =
   | { type: "error"; error: string };
 
 const SERVER_CACHE_TTL_MS = 5 * 60 * 1000;
+const SERVER_CACHE_VERSION = "recent-v2";
 const SERVER_CACHE = new Map<string, { digest: DigestData; cachedAt: number }>();
 
 export async function POST(req: NextRequest) {
@@ -57,6 +58,7 @@ export async function POST(req: NextRequest) {
         const timingsMs: Record<string, number> = {};
         let latestQueryCount: number | undefined;
         let latestSearchPages: number | undefined;
+        let latestSearchWarnings: string[] = [];
         let paintedFastDigest = false;
         let lastProgressDigestAt = 0;
         const finishPhase = (phase: string) => {
@@ -108,6 +110,7 @@ export async function POST(req: NextRequest) {
         const fullSearchPromise = searchSlack(timeWindow, token, backendUrl, preferences, (progress) => {
           latestQueryCount = progress.queryCount;
           latestSearchPages = progress.searchPages;
+          latestSearchWarnings = progress.warnings ?? latestSearchWarnings;
           const now = Date.now();
           if (progress.results.length === 0 || now - lastProgressDigestAt < 650) {
             return;
@@ -124,6 +127,7 @@ export async function POST(req: NextRequest) {
                 phase: "search_progress",
                 queryCount: progress.queryCount,
                 searchPages: progress.searchPages,
+                searchWarnings: progress.warnings,
               },
             },
           });
@@ -177,6 +181,7 @@ export async function POST(req: NextRequest) {
               phase: "fast_digest",
               queryCount: latestQueryCount,
               searchPages: latestSearchPages,
+              searchWarnings: latestSearchWarnings,
               timingsMs: { ...timingsMs },
             },
           },
@@ -186,6 +191,7 @@ export async function POST(req: NextRequest) {
         send({ type: "status", phase: "ai_digest", message: "Writing AI summaries and action suggestions..." });
         const digest = await generateDigestViaGleanChat(results, timeWindow, token, backendUrl);
         finishPhase("ai_digest");
+        const digestTimings = digest.debug?.timingsMs ?? {};
         timingsMs.total = Date.now() - startedAt;
         const completeDigest: DigestData = {
           ...digest,
@@ -196,7 +202,11 @@ export async function POST(req: NextRequest) {
             phase: "complete",
             queryCount: latestQueryCount,
             searchPages: latestSearchPages,
-            timingsMs,
+            searchWarnings: latestSearchWarnings,
+            timingsMs: {
+              ...timingsMs,
+              ...digestTimings,
+            },
           },
         };
         setServerCache(cacheKey, completeDigest);
@@ -226,7 +236,7 @@ function makeServerCacheKey(
   timeWindow: TimeWindow,
   preferences: DigestPreferences
 ) {
-  return `${backendUrl}:${timeWindow}:${token.slice(-12)}:${stableStringify(preferences)}`;
+  return `${SERVER_CACHE_VERSION}:${backendUrl}:${timeWindow}:${token.slice(-12)}:${stableStringify(preferences)}`;
 }
 
 function getServerCache(key: string) {

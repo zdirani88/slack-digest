@@ -636,6 +636,7 @@ function formatDebugMetrics(digest: DigestData) {
     debug.searchPages !== undefined ? `${debug.searchPages} pages` : "",
     debug.timingsMs?.search !== undefined ? `search ${formatMs(debug.timingsMs.search)}` : "",
     debug.timingsMs?.ai_digest !== undefined ? `AI ${formatMs(debug.timingsMs.ai_digest)}` : "",
+    debug.searchWarnings?.length ? `${debug.searchWarnings.length} search warnings` : "",
   ].filter(Boolean);
 
   return parts.join(" · ");

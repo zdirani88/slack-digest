@@ -22,7 +22,6 @@ const OPTIONAL_GLEAN_TIMEOUT_MS = 5000;
 const SEARCH_TARGET_RESULTS = 190;
 const GRAPH_CONTEXT_LIMIT = 16;
 const AI_MESSAGE_LIMIT = 60;
-const AI_ENRICHMENT_LIMIT = 20;
 const PEOPLE_BOOST_CACHE = new Map<string, number>();
 const AI_ENRICHMENT_CACHE = new Map<string, AiDigestEnrichment>();
 
@@ -43,7 +42,7 @@ type MessageCandidate = {
   graphContext: DigestGraphContext;
 };
 
-type AiDigestEnrichment = {
+export type AiDigestEnrichment = {
   summary?: string;
   threadSummary?: string;
   reason?: string;
@@ -75,6 +74,7 @@ export type SearchProgress = {
   page: number;
   queryCount: number;
   searchPages: number;
+  warnings?: string[];
 };
 
 export type FastSearchProgress = SearchProgress & {
@@ -109,7 +109,7 @@ export async function searchSlackFast(
         },
       });
       const slackResults = (data.results ?? []).filter(isSlackResult);
-      const expanded = slackResults.flatMap(expandSlackResult);
+      const expanded = slackResults.flatMap(expandSlackResult).filter((result) => isResultInTimeRange(result, timeRange));
 
       collected.push(...expanded);
       settledQueries += 1;
@@ -140,6 +140,7 @@ export async function searchSlack(
 
   const collected: GleanSearchResult[] = [];
   const errors: string[] = [];
+  const warnings: string[] = [];
   let hitRateLimit = false;
   let searchPages = 0;
 
@@ -166,7 +167,7 @@ export async function searchSlack(
         });
 
         const slackResults = (data.results ?? []).filter(isSlackResult);
-        const expanded = slackResults.flatMap(expandSlackResult);
+        const expanded = slackResults.flatMap(expandSlackResult).filter((result) => isResultInTimeRange(result, timeRange));
         collected.push(...expanded);
         searchPages += 1;
 
@@ -176,6 +177,7 @@ export async function searchSlack(
           page: page + 1,
           queryCount: queryIndex + 1,
           searchPages,
+          warnings,
         });
 
         if (!data.hasMoreResults || !data.cursor) {
@@ -188,13 +190,39 @@ export async function searchSlack(
         if (isRateLimitError(message)) {
           hitRateLimit = true;
         }
-        errors.push(`query="${query || "<blank>"}" page=${page + 1}: ${summarizeSearchError(message)}`);
+        const warning = `query="${query || "<blank>"}" page=${page + 1}: ${summarizeSearchError(message)}`;
+        errors.push(warning);
+        warnings.push(warning);
+        logPerf("search_page_error", 0, { query: query || "<blank>", page: page + 1, warning });
         break;
       }
     }
   }
 
-  const deduped = dedupeSlackResults(collected).slice(0, 220);
+  let deduped = dedupeSlackResults(collected).filter((result) => isResultInTimeRange(result, timeRange)).slice(0, 220);
+
+  if (deduped.length < 25 && !hitRateLimit) {
+    const fallbackStartedAt = Date.now();
+    const fallbackResults = await searchSlackLowResultFallback({
+      url,
+      token,
+      timeRange,
+      collected,
+      onProgress,
+      warnings,
+      searchPages,
+      queryOffset: queries.length,
+    });
+    collected.push(...fallbackResults.results);
+    searchPages = fallbackResults.searchPages;
+    warnings.push(...fallbackResults.warnings);
+    deduped = dedupeSlackResults(collected).filter((result) => isResultInTimeRange(result, timeRange)).slice(0, 220);
+    logPerf("low_result_fallback", Date.now() - fallbackStartedAt, {
+      results: deduped.length,
+      searchPages,
+      warnings: fallbackResults.warnings.length,
+    });
+  }
 
   if (deduped.length === 0 && errors.length > 0) {
     if (hitRateLimit) {
@@ -205,6 +233,88 @@ export async function searchSlack(
   }
 
   return deduped;
+}
+
+async function searchSlackLowResultFallback({
+  url,
+  token,
+  timeRange,
+  collected,
+  onProgress,
+  warnings,
+  searchPages,
+  queryOffset,
+}: {
+  url: string;
+  token: string;
+  timeRange: { startTimestamp: number; endTimestamp: number };
+  collected: GleanSearchResult[];
+  onProgress?: (progress: SearchProgress) => void;
+  warnings: string[];
+  searchPages: number;
+  queryOffset: number;
+}) {
+  const fallbackQueries: SearchQueryPlan[] = [
+    { query: "", pages: 2, broad: true },
+    { query: "thread", pages: 1, broad: true },
+    { query: "customer product engineering sales partner", pages: 1, broad: true },
+  ];
+  const fallbackWarnings: string[] = [];
+  const fallbackCollected: GleanSearchResult[] = [];
+
+  for (let queryIndex = 0; queryIndex < fallbackQueries.length; queryIndex += 1) {
+    const { query, pages } = fallbackQueries[queryIndex];
+    let cursor: string | undefined;
+
+    for (let page = 0; page < pages; page += 1) {
+      try {
+        const data = await fetchSearchPage({
+          url,
+          token,
+          query,
+          timeRange,
+          cursor,
+          options: {
+            pageSize: 75,
+            maxSnippetSize: 1200,
+            returnLlmContentOverSnippets: false,
+            timeoutMs: 12000,
+          },
+        });
+
+        const slackResults = (data.results ?? []).filter(isSlackResult);
+        const expanded = slackResults.flatMap(expandSlackResult).filter((result) => isResultInTimeRange(result, timeRange));
+        fallbackCollected.push(...expanded);
+        searchPages += 1;
+
+        onProgress?.({
+          results: dedupeSlackResults([...collected, ...fallbackCollected]).slice(0, 220),
+          query,
+          page: page + 1,
+          queryCount: queryOffset + queryIndex + 1,
+          searchPages,
+          warnings: [...warnings, ...fallbackWarnings],
+        });
+
+        if (!data.hasMoreResults || !data.cursor) {
+          break;
+        }
+
+        cursor = data.cursor;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown Glean search error";
+        const warning = `fallback query="${query || "<blank>"}" page=${page + 1}: ${summarizeSearchError(message)}`;
+        fallbackWarnings.push(warning);
+        logPerf("search_fallback_error", 0, { query: query || "<blank>", page: page + 1, warning });
+        if (isRateLimitError(message)) {
+          return { results: fallbackCollected, searchPages, warnings: fallbackWarnings };
+        }
+        break;
+      }
+    }
+  }
+
+  return { results: fallbackCollected, searchPages, warnings: fallbackWarnings };
 }
 
 function buildSearchQueries(preferences: DigestPreferences): SearchQueryPlan[] {
@@ -291,11 +401,27 @@ export async function generateDigestViaGleanChat(
   token: string,
   backendUrl: string
 ): Promise<DigestData> {
+  const timingsMs: Record<string, number> = {};
+  const startedAt = Date.now();
+  const finish = (phase: string, phaseStartedAt: number) => {
+    timingsMs[phase] = Date.now() - phaseStartedAt;
+    logPerf(phase, timingsMs[phase], { results: results.length });
+  };
+
+  const hydrateStartedAt = Date.now();
   const messages = buildMessageCandidates(results);
+  finish("candidate_hydration", hydrateStartedAt);
 
   // Keep the AI prompt bounded even when retrieval gets much broader.
+  const localRankStartedAt = Date.now();
   const initialCandidates = prioritizeMessages(messages).slice(0, AI_MESSAGE_LIMIT);
+  finish("initial_ranking", localRankStartedAt);
+
+  const graphStartedAt = Date.now();
   const graphContexts = await fetchGraphContexts(initialCandidates, token, backendUrl);
+  finish("graph_context", graphStartedAt);
+
+  const graphMergeStartedAt = Date.now();
   const graphMessages = messages.map((message) => {
     const graphContext = graphContexts.get(message.id) ?? emptyGraphContext();
     return {
@@ -308,14 +434,22 @@ export async function generateDigestViaGleanChat(
     };
   });
   const aiMessages = prioritizeMessages(graphMessages).slice(0, AI_MESSAGE_LIMIT);
-  const itemEnrichments = await generateItemEnrichmentsViaGleanChat(
-    aiMessages.slice(0, AI_ENRICHMENT_LIMIT),
-    token,
-    backendUrl
-  ).catch(() => new Map<string, AiDigestEnrichment>());
+  finish("graph_merge_rerank", graphMergeStartedAt);
+
+  const enrichmentStartedAt = Date.now();
+  const itemEnrichments = getCachedItemEnrichments(aiMessages);
+  finish("cached_ai_enrichment", enrichmentStartedAt);
+
+  const localGroupingStartedAt = Date.now();
   const localGroups = buildFallbackGroups(aiMessages, itemEnrichments);
   const groups = enrichGroups(ensureAllGroups(localGroups), graphMessages, itemEnrichments);
   const totalItems = groups.reduce((sum, g) => sum + g.items.length, 0);
+  finish("local_grouping", localGroupingStartedAt);
+  timingsMs.digest_generation_total = Date.now() - startedAt;
+  logPerf("digest_generation_total", timingsMs.digest_generation_total, {
+    results: results.length,
+    cachedEnrichedItems: itemEnrichments.size,
+  });
 
   return {
     groups,
@@ -323,6 +457,9 @@ export async function generateDigestViaGleanChat(
     timeWindow,
     totalItems,
     status: "complete",
+    debug: {
+      timingsMs,
+    },
   };
 }
 
@@ -450,7 +587,7 @@ async function fetchSearchPage({
     body: JSON.stringify({
       query,
       datasourceFilter: "SLACK",
-      pageSize: options.pageSize ?? 35,
+      pageSize: options.pageSize ?? 60,
       timeRange,
       returnLlmContentOverSnippets: options.returnLlmContentOverSnippets ?? true,
       maxSnippetSize: options.maxSnippetSize ?? 2500,
@@ -735,7 +872,8 @@ function emptyGraphSeed(): GraphSeed {
 async function generateItemEnrichmentsViaGleanChat(
   messages: MessageCandidate[],
   token: string,
-  backendUrl: string
+  backendUrl: string,
+  options: { timeoutMs?: number } = {}
 ): Promise<Map<string, AiDigestEnrichment>> {
   if (messages.length === 0) {
     return new Map();
@@ -762,7 +900,7 @@ async function generateItemEnrichmentsViaGleanChat(
 
   for (let index = 0; index < pending.length; index += batchSize) {
     const batch = pending.slice(index, index + batchSize);
-    batchPromises.push(generateItemEnrichmentBatchViaGleanChat(batch, token, backendUrl));
+    batchPromises.push(generateItemEnrichmentBatchViaGleanChat(batch, token, backendUrl, options));
   }
 
   const batchResults = await Promise.allSettled(batchPromises);
@@ -781,6 +919,48 @@ async function generateItemEnrichmentsViaGleanChat(
   return enrichments;
 }
 
+export async function enrichDigestItemsViaGleanChat(
+  items: DigestItem[],
+  token: string,
+  backendUrl: string,
+  options: { timeoutMs?: number } = {}
+): Promise<Map<string, AiDigestEnrichment>> {
+  const candidates = items.map(digestItemToMessageCandidate);
+  return generateItemEnrichmentsViaGleanChat(candidates, token, backendUrl, options);
+}
+
+function digestItemToMessageCandidate(item: DigestItem): MessageCandidate {
+  return {
+    id: item.id,
+    title: item.title,
+    channel: item.channel ?? "unknown",
+    channelUrl: item.channelUrl ?? "",
+    channelId: item.channelId ?? "",
+    author: item.author ?? "unknown",
+    timestamp: item.timestamp ?? item.latestActivityTimestamp ?? item.originalTimestamp ?? "",
+    originalTimestamp: item.originalTimestamp ?? "",
+    latestActivityTimestamp: item.latestActivityTimestamp ?? item.timestamp ?? item.originalTimestamp ?? "",
+    url: item.url ?? "",
+    authorUrl: item.authorUrl ?? "",
+    content: item.fullText ?? item.rawExcerpt ?? item.preview ?? item.summary ?? item.title,
+    signals: item.signals ?? emptySignals(),
+    graphContext: item.graphContext ?? emptyGraphContext(),
+  };
+}
+
+function getCachedItemEnrichments(messages: MessageCandidate[]): Map<string, AiDigestEnrichment> {
+  const enrichments = new Map<string, AiDigestEnrichment>();
+
+  for (const message of messages) {
+    const cached = AI_ENRICHMENT_CACHE.get(getAiEnrichmentCacheKey(message));
+    if (cached) {
+      enrichments.set(message.id, cached);
+    }
+  }
+
+  return enrichments;
+}
+
 function getAiEnrichmentCacheKey(message: MessageCandidate) {
   return [
     message.id,
@@ -791,7 +971,8 @@ function getAiEnrichmentCacheKey(message: MessageCandidate) {
 async function generateItemEnrichmentBatchViaGleanChat(
   messages: MessageCandidate[],
   token: string,
-  backendUrl: string
+  backendUrl: string,
+  options: { timeoutMs?: number } = {}
 ): Promise<Map<string, AiDigestEnrichment>> {
   const chatUrl = `${backendUrl.replace(/\/$/, "")}/rest/api/v1/chat`;
   const prompt = `You are creating concise Slack digest entries for Zubin.
@@ -835,17 +1016,22 @@ ${JSON.stringify(
   2
 )}`;
 
-  const res = await fetchWithRetry(chatUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
+  const res = await fetchWithRetry(
+    chatUrl,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: [{ author: "USER", fragments: [{ text: prompt }] }],
+        stream: false,
+      }),
     },
-    body: JSON.stringify({
-      messages: [{ author: "USER", fragments: [{ text: prompt }] }],
-      stream: false,
-    }),
-  });
+    0,
+    options.timeoutMs ?? GLEAN_TIMEOUT_MS
+  );
 
   if (!res.ok) {
     const body = await readErrorBody(res);
@@ -978,6 +1164,45 @@ function isSlackResult(result: GleanSearchResult) {
 function expandSlackResult(result: GleanSearchResult): GleanSearchResult[] {
   const clustered = (result.clusteredResults ?? []).filter(isSlackResult);
   return [result, ...clustered];
+}
+
+function isResultInTimeRange(
+  result: GleanSearchResult,
+  timeRange: { startTimestamp: number; endTimestamp: number }
+) {
+  const timestamps = collectResultTimestamps(result);
+  if (timestamps.length === 0) {
+    return true;
+  }
+
+  const startMs = (timeRange.startTimestamp - 2 * 60 * 60) * 1000;
+  const endMs = (timeRange.endTimestamp + 15 * 60) * 1000;
+  return timestamps.some((timestamp) => timestamp >= startMs && timestamp <= endMs);
+}
+
+function collectResultTimestamps(result: GleanSearchResult): number[] {
+  const values = [
+    result.document?.metadata?.createTime,
+    result.document?.metadata?.updateTime,
+    ...((result.relatedResults ?? [])
+      .flatMap((group) => group.results ?? [])
+      .flatMap((entry) => [
+        entry.document?.metadata?.createTime,
+        entry.document?.metadata?.updateTime,
+      ])),
+    ...((result.clusteredResults ?? [])
+      .flatMap((entry) => collectResultTimestamps(entry).map((timestamp) => new Date(timestamp).toISOString()))),
+  ];
+
+  return values
+    .map((value) => {
+      if (!value) return 0;
+      const time = new Date(value).getTime();
+      if (Number.isNaN(time)) return 0;
+      if (new Date(time).getUTCFullYear() <= 1971) return 0;
+      return time;
+    })
+    .filter((time) => time > 0);
 }
 
 function dedupeSlackResults(results: GleanSearchResult[]) {
@@ -1788,4 +2013,11 @@ function normalizeText(value: unknown) {
 
 function deriveTitleFromPreview(preview: string) {
   return preview.length > 80 ? `${preview.slice(0, 77)}...` : preview;
+}
+
+function logPerf(phase: string, durationMs: number, details: Record<string, unknown> = {}) {
+  console.info("[SlackDigestPerf]", phase, {
+    durationMs,
+    ...details,
+  });
 }

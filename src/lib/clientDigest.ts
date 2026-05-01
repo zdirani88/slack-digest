@@ -1,5 +1,5 @@
 import { AppRouterInstance } from "next/dist/shared/lib/app-router-context.shared-runtime";
-import { DigestData, DigestPreferences, TimeWindow } from "@/types";
+import { DigestData, DigestItem, DigestPreferences, TimeWindow } from "@/types";
 
 export async function fetchDigest({
   timeWindow,
@@ -58,9 +58,105 @@ export async function fetchDigest({
   }
 }
 
+export async function enrichDigestInBackground({
+  digest,
+  onProgress,
+}: {
+  digest: DigestData;
+  onProgress: (digest: DigestData) => void;
+}) {
+  if (digest.status !== "complete") return;
+
+  const token = localStorage.getItem("glean_token");
+  const backendUrl = localStorage.getItem("glean_backend_url");
+  if (!token || !backendUrl) return;
+
+  const items = selectItemsForBackgroundEnrichment(digest);
+  if (items.length === 0) return;
+
+  const enrichmentKey = makeBackgroundEnrichmentKey(digest, backendUrl, items);
+  if (COMPLETED_ENRICHMENTS.has(enrichmentKey)) return;
+
+  const existing = ENRICHMENT_INFLIGHT.get(enrichmentKey);
+  const request = existing ?? requestBackgroundEnrichment({ enrichmentKey, token, backendUrl, items });
+  ENRICHMENT_INFLIGHT.set(enrichmentKey, request);
+
+  const enrichedItems = await request;
+  if (enrichedItems.length === 0) return;
+
+  COMPLETED_ENRICHMENTS.add(enrichmentKey);
+
+  const enrichedDigest = applyEnrichmentsToDigest(digest, enrichedItems);
+  const preferences = readDigestPreferences();
+  const cacheKey = makeDigestCacheKey(digest.timeWindow, backendUrl, preferences);
+  setMemoryCache(cacheKey, enrichedDigest);
+  setStorageCache(cacheKey, enrichedDigest);
+  onProgress(enrichedDigest);
+}
+
 const DIGEST_CACHE_TTL_MS = 5 * 60 * 1000;
+const DIGEST_CACHE_VERSION = "recent-v2";
+const BACKGROUND_ENRICHMENT_TIMEOUT_MS = 16000;
 const MEMORY_CACHE = new Map<string, { digest: DigestData; cachedAt: number }>();
 const INFLIGHT = new Map<string, Promise<DigestData>>();
+const ENRICHMENT_INFLIGHT = new Map<string, Promise<Array<Partial<DigestItem> & { id?: string }>>>();
+const COMPLETED_ENRICHMENTS = new Set<string>();
+
+async function requestBackgroundEnrichment({
+  enrichmentKey,
+  token,
+  backendUrl,
+  items,
+}: {
+  enrichmentKey: string;
+  token: string;
+  backendUrl: string;
+  items: DigestItem[];
+}) {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), BACKGROUND_ENRICHMENT_TIMEOUT_MS);
+
+  console.info("[SlackDigestPerf] background_enrichment_start", { items: items.length });
+
+  try {
+    const res = await fetch("/api/digest/enrich", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-glean-token": token,
+        "x-glean-backend": backendUrl,
+      },
+      body: JSON.stringify({ items }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      console.info("[SlackDigestPerf] background_enrichment_failed", {
+        durationMs: Date.now() - startedAt,
+        status: res.status,
+      });
+      return [];
+    }
+
+    const data = await res.json().catch(() => ({}));
+    const enrichedItems = Array.isArray(data.items) ? data.items : [];
+    console.info("[SlackDigestPerf] background_enrichment_complete", {
+      durationMs: Date.now() - startedAt,
+      items: enrichedItems.length,
+    });
+    return enrichedItems;
+  } catch (error) {
+    console.info("[SlackDigestPerf] background_enrichment_aborted", {
+      durationMs: Date.now() - startedAt,
+      reason: error instanceof Error ? error.name : "unknown",
+    });
+    return [];
+  } finally {
+    window.clearTimeout(timeout);
+    ENRICHMENT_INFLIGHT.delete(enrichmentKey);
+  }
+}
 
 async function requestDigest({
   timeWindow,
@@ -168,8 +264,53 @@ function parseStreamEvent(line: string): null | {
   }
 }
 
+function selectItemsForBackgroundEnrichment(digest: DigestData) {
+  return digest.groups
+    .flatMap((group) => group.items)
+    .sort((a, b) => (b.rankingScore ?? 0) - (a.rankingScore ?? 0))
+    .filter((item) => item.id && (item.fullText || item.rawExcerpt || item.preview || item.title))
+    .slice(0, 4);
+}
+
+function makeBackgroundEnrichmentKey(digest: DigestData, backendUrl: string, items: DigestItem[]) {
+  return [
+    "enrich",
+    digest.timeWindow,
+    backendUrl,
+    digest.generatedAt,
+    items.map((item) => `${item.id}:${item.latestActivityTimestamp ?? item.timestamp ?? ""}`).join("|"),
+  ].join(":");
+}
+
+function applyEnrichmentsToDigest(
+  digest: DigestData,
+  enrichments: Array<Partial<DigestItem> & { id?: string }>
+): DigestData {
+  const byId = new Map(enrichments.filter((item) => item.id).map((item) => [item.id!, item]));
+
+  return {
+    ...digest,
+    progressMessage: "Background AI summaries updated.",
+    groups: digest.groups.map((group) => ({
+      ...group,
+      items: group.items.map((item) => {
+        const enrichment = byId.get(item.id);
+        if (!enrichment) return item;
+
+        return {
+          ...item,
+          summary: enrichment.summary ?? item.summary,
+          threadSummary: enrichment.threadSummary ?? item.threadSummary,
+          reason: enrichment.reason ?? item.reason,
+          suggestedActions: enrichment.suggestedActions ?? item.suggestedActions,
+        };
+      }),
+    })),
+  };
+}
+
 function makeDigestCacheKey(timeWindow: TimeWindow, backendUrl: string, preferences: DigestPreferences) {
-  return `digest:${timeWindow}:${backendUrl}:${stableStringify(preferences)}`;
+  return `digest:${DIGEST_CACHE_VERSION}:${timeWindow}:${backendUrl}:${stableStringify(preferences)}`;
 }
 
 function getMemoryCache(key: string) {

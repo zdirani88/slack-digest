@@ -34,6 +34,11 @@ export interface GleanSearchResult {
   relatedResults?: Array<{
     relation?: string;
     results?: Array<{
+      document?: {
+        id?: string;
+        datasource?: string;
+        metadata?: GleanDocumentMetadata;
+      };
       snippets?: GleanSnippet[];
     }>;
   }>;
@@ -130,6 +135,7 @@ export interface DigestData {
     phase?: string;
     queryCount?: number;
     searchPages?: number;
+    searchWarnings?: string[];
     timingsMs?: Record<string, number>;
   };
 }

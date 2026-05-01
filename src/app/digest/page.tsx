@@ -4,8 +4,8 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { DigestData, TimeWindow } from "@/types";
 import DigestView from "@/components/DigestView";
-import { fetchDigest, formatErrorMessage } from "@/lib/clientDigest";
-import { RefreshCw, LogOut, Clock, Newspaper } from "lucide-react";
+import { enrichDigestInBackground, fetchDigest, formatErrorMessage } from "@/lib/clientDigest";
+import { Compass, RefreshCw, LogOut, Clock, Newspaper } from "lucide-react";
 
 const TIME_WINDOW_LABELS: Record<TimeWindow, string> = {
   "24h": "Last 24 hours",
@@ -21,6 +21,7 @@ export default function DigestPage() {
   const [error, setError] = useState("");
   const [timeWindow, setTimeWindow] = useState<TimeWindow>("24h");
   const requestIdRef = useRef(0);
+  const enrichmentKeysRef = useRef<Set<string>>(new Set());
 
   const generate = useCallback(
     async (tw: TimeWindow, force = false) => {
@@ -72,6 +73,30 @@ export default function DigestPage() {
     generate(timeWindow);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!digest || digest.status !== "complete" || loading) return;
+
+    const key = `${digest.timeWindow}:${digest.generatedAt}:${digest.totalItems}`;
+    if (enrichmentKeysRef.current.has(key)) return;
+    enrichmentKeysRef.current.add(key);
+
+    const timer = window.setTimeout(() => {
+      enrichDigestInBackground({
+        digest,
+        onProgress: (enrichedDigest) => {
+          setDigest((current) => {
+            if (!current || current.generatedAt !== digest.generatedAt) return current;
+            return enrichedDigest;
+          });
+        },
+      }).catch(() => {
+        // Background enrichment should never disturb the primary digest.
+      });
+    }, 1500);
+
+    return () => window.clearTimeout(timer);
+  }, [digest?.generatedAt, digest?.status, digest?.timeWindow, digest?.totalItems, loading]);
+
   function handleTimeWindowChange(tw: TimeWindow) {
     setTimeWindow(tw);
     generate(tw);
@@ -118,6 +143,14 @@ export default function DigestPage() {
           >
             <Newspaper className="h-3.5 w-3.5" />
             Briefing
+          </button>
+
+          <button
+            onClick={() => router.push("/personal")}
+            className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-stone-600 transition-colors hover:bg-stone-100"
+          >
+            <Compass className="h-3.5 w-3.5" />
+            Personal
           </button>
 
           <button

@@ -4,8 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { BriefingData, BriefingStory, DigestData, TimeWindow } from "@/types";
 import { buildBriefing } from "@/lib/briefing";
-import { fetchDigest } from "@/lib/clientDigest";
-import { Archive, ArrowLeft, Clock, ExternalLink, RefreshCw, RotateCcw, ThumbsDown } from "lucide-react";
+import { enrichDigestInBackground, fetchDigest } from "@/lib/clientDigest";
+import { Archive, ArrowLeft, Clock, Compass, ExternalLink, RefreshCw, RotateCcw, ThumbsDown } from "lucide-react";
 
 const TIME_LABELS: Record<TimeWindow, string> = {
   "24h": "24 hours",
@@ -26,6 +26,7 @@ export default function BriefingPage() {
   const [error, setError] = useState("");
   const [readStoryIds, setReadStoryIds] = useState<Set<string>>(new Set());
   const requestIdRef = useRef(0);
+  const enrichmentKeysRef = useRef<Set<string>>(new Set());
   const briefing = useMemo(() => (digest ? filterReadStories(buildBriefing(digest), readStoryIds) : null), [digest, readStoryIds]);
 
   useEffect(() => {
@@ -82,6 +83,30 @@ export default function BriefingPage() {
     generate(timeWindow);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!digest || digest.status !== "complete" || loading) return;
+
+    const key = `${digest.timeWindow}:${digest.generatedAt}:${digest.totalItems}`;
+    if (enrichmentKeysRef.current.has(key)) return;
+    enrichmentKeysRef.current.add(key);
+
+    const timer = window.setTimeout(() => {
+      enrichDigestInBackground({
+        digest,
+        onProgress: (enrichedDigest) => {
+          setDigest((current) => {
+            if (!current || current.generatedAt !== digest.generatedAt) return current;
+            return enrichedDigest;
+          });
+        },
+      }).catch(() => {
+        // Background enrichment should never disturb the primary briefing.
+      });
+    }, 1500);
+
+    return () => window.clearTimeout(timer);
+  }, [digest?.generatedAt, digest?.status, digest?.timeWindow, digest?.totalItems, loading]);
+
   function changeWindow(next: TimeWindow) {
     setTimeWindow(next);
     generate(next);
@@ -131,6 +156,13 @@ export default function BriefingPage() {
                 </button>
               ))}
             </div>
+            <button
+              onClick={() => router.push("/personal")}
+              className="inline-flex items-center gap-2 rounded-full border border-stone-300 bg-white/60 px-3 py-2 text-sm font-semibold text-stone-600 hover:bg-white"
+            >
+              <Compass className="h-4 w-4" />
+              Personal brief
+            </button>
             <button
               onClick={restoreRead}
               disabled={readStoryIds.size === 0}
